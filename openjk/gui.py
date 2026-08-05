@@ -11,7 +11,7 @@ from typing import Any
 from .engine import BMSState, BleWorker, DeviceRow
 from .protocol import SETTINGS, settings_rows
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 
 
 class OpenJKApp:

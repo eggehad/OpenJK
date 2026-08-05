@@ -71,6 +71,7 @@ class BleWorker:
         self.poll_task: Optional[asyncio.Task] = None
         self.running = True
         self.counter = 0
+        self.characteristic_uuid: Optional[str] = None
         self.thread.start()
 
     def send(self, command: str, payload: Any = None) -> None:
@@ -135,14 +136,58 @@ class BleWorker:
     async def _connect(self, device: BLEDevice) -> None:
         await self._disconnect()
         self.assembler = FrameAssembler()
+        self.characteristic_uuid = None
         self._emit("status", f"Connecting to {device.name or device.address}...")
         self.client = BleakClient(device, disconnected_callback=self._on_disconnect)
         await self.client.connect(timeout=20.0)
-        await self.client.start_notify(CHAR_UUID, self._notification)
+
+        # Do not assume every JK firmware exposes the data characteristic in
+        # exactly the same cached Windows service layout. Resolve it from the
+        # services actually reported by this BMS.
+        services = self.client.services
+        characteristic = services.get_characteristic(CHAR_UUID)
+
+        if characteristic is None:
+            candidates = []
+            for service in services:
+                for item in service.characteristics:
+                    short_uuid = item.uuid.lower().replace("-", "")
+                    properties = {prop.lower() for prop in item.properties}
+                    if short_uuid.startswith("0000ffe1"):
+                        candidates.insert(0, item)
+                    elif (
+                        ("notify" in properties or "indicate" in properties)
+                        and ("write" in properties or "write-without-response" in properties)
+                    ):
+                        candidates.append(item)
+
+            if candidates:
+                characteristic = candidates[0]
+
+        if characteristic is None:
+            discovered = []
+            for service in services:
+                for item in service.characteristics:
+                    discovered.append(
+                        f"{item.uuid} [{', '.join(item.properties)}]"
+                    )
+            raise RuntimeError(
+                "No JK notify/write characteristic found. "
+                "Discovered characteristics: " + "; ".join(discovered)
+            )
+
+        self.characteristic_uuid = characteristic.uuid
+        self._emit(
+            "status",
+            f"Using BLE characteristic {self.characteristic_uuid}",
+        )
+        await self.client.start_notify(self.characteristic_uuid, self._notification)
+
         self._emit("connected", {
             "connected": True,
             "name": device.name or "",
             "address": device.address,
+            "characteristic": self.characteristic_uuid,
         })
         self._emit("status", f"Connected to {device.name or device.address}")
 
@@ -161,7 +206,13 @@ class BleWorker:
     async def _write(self, payload: bytes) -> None:
         if not self.client or not self.client.is_connected:
             raise RuntimeError("Not connected")
-        await self.client.write_gatt_char(CHAR_UUID, payload, response=False)
+        if not self.characteristic_uuid:
+            raise RuntimeError("JK BLE characteristic has not been resolved")
+        await self.client.write_gatt_char(
+            self.characteristic_uuid,
+            payload,
+            response=False,
+        )
         self._emit("tx", payload)
 
     async def _disconnect(self) -> None:
@@ -172,12 +223,14 @@ class BleWorker:
             try:
                 if self.client.is_connected:
                     try:
-                        await self.client.stop_notify(CHAR_UUID)
+                        if self.characteristic_uuid:
+                            await self.client.stop_notify(self.characteristic_uuid)
                     except Exception:
                         pass
                     await self.client.disconnect()
             finally:
                 self.client = None
+                self.characteristic_uuid = None
         self._emit("connected", {"connected": False})
 
     def _on_disconnect(self, _client: BleakClient) -> None:
