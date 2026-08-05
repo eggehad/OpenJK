@@ -1,33 +1,27 @@
-# OpenJK v0.2.1
+# OpenJK v0.3.0
 
 OpenJK is an open-source protocol engine and engineering toolkit for JK Smart BMS systems over Bluetooth LE.
 
-## v0.2.1 compatibility fix
+## First guarded write
 
-- Resolves the JK GATT characteristic from each BMS's actual discovered services
-- Supports firmware variants that do not expose the expected characteristic through the same Windows cache entry
-- Reports every discovered characteristic if no suitable notify/write endpoint exists
+v0.3 introduces one deliberately narrow write path:
 
-## Deliverable 1: complete read engine
+**JK02_32S / PB / V19 current calibration, holding register `0x67`.**
 
-v0.2 adds the first engine-focused milestone:
+The entered value is the independently measured current actually flowing through the selected BMS. It is not a gain coefficient or an offset. OpenJK encodes the value in milliamperes as a four-byte little-endian register write.
 
-- Reads and decodes the complete JK PB/V19 settings frame (`0x01`)
-- Reads the complete live-data frame (`0x02`)
-- Reads device identity and communications information (`0x03`)
-- Displays decoded settings by category
-- Captures all 32 configured wire-resistance values
-- Decodes the controls bitmask
-- Saves a complete JSON backup containing:
-  - BMS identity
-  - every decoded setting
-  - wire resistance array
-  - control flags
-  - a live status snapshot
-- Keeps raw BLE traffic for protocol verification
-- Uses separate protocol, engine, and GUI modules
+Before transmission, OpenJK:
 
-**v0.2 remains read-only. It does not write settings.**
+1. Requires a live connection and a settings frame.
+2. Shows the exact selected BMS identity.
+3. Shows the JK current and proposed reference current.
+4. Shows the exact register, raw value, and 20-byte BLE frame.
+5. Requires explicit confirmation.
+6. Saves an automatic JSON backup in `backups/`.
+7. Logs the transmitted frame and all replies.
+8. Waits for stale telemetry to clear and requests fresh data.
+
+All protection, MOSFET, balancing, temperature, capacity, and voltage settings remain read-only in this release.
 
 ## Install
 
@@ -41,27 +35,31 @@ python -m pip install -r requirements.txt
 python openjk.py
 ```
 
-Or double-click `run_openjk.bat`.
+## Current-calibration procedure
 
-## Test procedure
+1. Connect to the intended BMS.
+2. Verify its advertised name (`-00` master or `-01` slave).
+3. Wait for live telemetry.
+4. Measure the current through that individual BMS using the Hantek/reference meter.
+5. Open **Current calibration**.
+6. Enter the independent measurement in amperes.
+7. Review the confirmation carefully.
+8. Write.
+9. Wait for fresh telemetry and compare again.
 
-1. Close or disconnect the JK Android app so it releases the BMS BLE connection.
-2. Click **Scan**.
-3. Select one of the JK devices.
-4. Click **Connect**.
-5. Open the **Settings** tab.
-6. Confirm the decoded values against the JK app.
-7. Click **Save backup…** and inspect the generated JSON.
+Because your BMS current telemetry updates in roughly 0.1 A steps and the system current changes rapidly, calibration is best performed under substantial, reasonably stable charge or discharge current.
 
-Please preserve the generated `openjk_raw_*.log` if any field is wrong. It lets us correct firmware-specific offsets without guessing.
+## Protocol basis
 
-## Protocol acknowledgement
+The BLE holding-register frame and the JK02_32S current-calibration register map are based on the community-maintained `syssi/esphome-jk-bms` protocol implementation:
 
-The JK BLE framing and PB-series field map are based on community reverse-engineering, especially the `syssi/esphome-jk-bms` project. OpenJK's Python engine, application structure, backup format, Windows BLE transport, and user interface are implemented for this project.
+- Register: `0x67`
+- Length: `4`
+- Scale: `1000` raw counts per ampere
+- Frame: `AA 55 90 EB`, register, length, little-endian value, zero padding, additive checksum
 
-## Next milestone
+OpenJK's Python transport, transaction safeguards, backups, logging, and user interface are implemented independently for this project.
 
-- Parameter metadata for writable registers
-- Backup diff and restore preview
-- Transactional writes with read-back verification
-- Current-calibration tool
+## Important
+
+This is the first write-capable test release. Use it only while watching the selected BMS and an independent reference instrument. Preserve the raw log if the BMS rejects the command or behaves unexpectedly.

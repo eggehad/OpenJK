@@ -11,7 +11,7 @@ from typing import Any
 from .engine import BMSState, BleWorker, DeviceRow
 from .protocol import SETTINGS, settings_rows
 
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.3.0"
 
 
 class OpenJKApp:
@@ -25,6 +25,7 @@ class OpenJKApp:
         self.worker = BleWorker(self.events)
         self.devices: list[DeviceRow] = []
         self.state = BMSState()
+        self.write_in_progress = False
 
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.raw_log = Path.cwd() / f"openjk_raw_{stamp}.log"
@@ -79,9 +80,11 @@ class OpenJKApp:
         cells_tab = ttk.Frame(notebook, padding=10)
         raw_tab = ttk.Frame(notebook, padding=10)
         identity_tab = ttk.Frame(notebook, padding=10)
+        calibration_tab = ttk.Frame(notebook, padding=10)
         notebook.add(dashboard, text="Dashboard")
         notebook.add(settings_tab, text="Settings")
         notebook.add(cells_tab, text="Cells")
+        notebook.add(calibration_tab, text="Current calibration")
         notebook.add(identity_tab, text="Identity")
         notebook.add(raw_tab, text="Raw frames")
 
@@ -145,6 +148,91 @@ class OpenJKApp:
             self.cells_tree.column(col, width=width, anchor="e")
         self.cells_tree.pack(fill="both", expand=True)
 
+        # Current calibration is intentionally the only write-enabled feature
+        # in v0.3. The entered value is the reference current measured by an
+        # independent instrument, not an arbitrary calibration coefficient.
+        warning = ttk.Label(
+            calibration_tab,
+            text=(
+                "WRITE-ENABLED: This sends the independently measured current "
+                "to the selected JK BMS so it can calibrate its current sensor."
+            ),
+            wraplength=760,
+            justify="left",
+        )
+        warning.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 14))
+
+        ttk.Label(calibration_tab, text="Selected BMS:").grid(
+            row=1, column=0, sticky="e", padx=(0, 10), pady=4
+        )
+        self.cal_device_var = tk.StringVar(value="Not connected")
+        ttk.Label(
+            calibration_tab,
+            textvariable=self.cal_device_var,
+            font=("Consolas", 10),
+        ).grid(row=1, column=1, sticky="w", pady=4)
+
+        ttk.Label(calibration_tab, text="JK reported current:").grid(
+            row=2, column=0, sticky="e", padx=(0, 10), pady=4
+        )
+        self.cal_jk_current_var = tk.StringVar(value="—")
+        ttk.Label(
+            calibration_tab,
+            textvariable=self.cal_jk_current_var,
+            font=("Consolas", 12, "bold"),
+        ).grid(row=2, column=1, sticky="w", pady=4)
+
+        ttk.Label(calibration_tab, text="Reference current:").grid(
+            row=3, column=0, sticky="e", padx=(0, 10), pady=4
+        )
+        self.cal_reference_var = tk.StringVar()
+        self.cal_reference_entry = ttk.Entry(
+            calibration_tab,
+            textvariable=self.cal_reference_var,
+            width=16,
+            font=("Consolas", 11),
+        )
+        self.cal_reference_entry.grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(calibration_tab, text="A").grid(
+            row=3, column=2, sticky="w", padx=(6, 0), pady=4
+        )
+
+        self.cal_write_button = ttk.Button(
+            calibration_tab,
+            text="Back up and write current calibration",
+            command=self._write_current_calibration,
+            state="disabled",
+        )
+        self.cal_write_button.grid(
+            row=4, column=1, sticky="w", pady=(14, 8)
+        )
+
+        self.cal_status_var = tk.StringVar(
+            value="Connect to a BMS and wait for live current before writing."
+        )
+        ttk.Label(
+            calibration_tab,
+            textvariable=self.cal_status_var,
+            wraplength=760,
+            justify="left",
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        ttk.Separator(calibration_tab, orient="horizontal").grid(
+            row=6, column=0, columnspan=3, sticky="ew", pady=18
+        )
+        ttk.Label(
+            calibration_tab,
+            text=(
+                "Procedure: enter the current measured through this individual "
+                "BMS by the Hantek/reference meter. OpenJK saves a JSON backup, "
+                "shows the exact BLE frame, asks for confirmation, writes it, "
+                "waits for stale telemetry to clear, and requests fresh data."
+            ),
+            wraplength=760,
+            justify="left",
+        ).grid(row=7, column=0, columnspan=3, sticky="w")
+        calibration_tab.columnconfigure(1, weight=1)
+
         self.identity_tree = ttk.Treeview(identity_tab, columns=("field", "value"), show="headings")
         self.identity_tree.heading("field", text="Field")
         self.identity_tree.heading("value", text="Value")
@@ -165,8 +253,8 @@ class OpenJKApp:
         ttk.Label(
             outer,
             text=(
-                "v0.2 reads and backs up the complete JK settings frame. "
-                "It still performs no setting writes."
+                "v0.3 enables one guarded write only: JK02_32S current calibration. "
+                "All protection and operating settings remain read-only."
             ),
         ).pack(anchor="w", pady=(8, 0))
 
@@ -177,6 +265,72 @@ class OpenJKApp:
             return
         index = int(selection[0])
         self.worker.send("connect", self.devices[index].device)
+
+    def _write_current_calibration(self) -> None:
+        if not self.state.selected_device_name:
+            messagebox.showerror("OpenJK", "Connect to the intended BMS first.")
+            return
+        if not self.state.settings:
+            messagebox.showerror(
+                "OpenJK",
+                "No settings backup is available yet. Click Read settings first.",
+            )
+            return
+
+        try:
+            reference = float(self.cal_reference_var.get().strip())
+        except ValueError:
+            messagebox.showerror(
+                "OpenJK",
+                "Enter the independently measured current in amperes.",
+            )
+            return
+
+        if not 0.1 <= reference <= 500.0:
+            messagebox.showerror(
+                "OpenJK",
+                "For this first write-enabled release, reference current must "
+                "be between 0.1 A and 500 A.",
+            )
+            return
+
+        from .protocol import make_current_calibration_command
+        frame = make_current_calibration_command(reference)
+        current = self.state.live.get("pack_current")
+        current_text = "unavailable" if current is None else f"{current:+.1f} A"
+
+        confirm = messagebox.askyesno(
+            "Confirm JK current calibration write",
+            (
+                f"Selected BMS:\n{self.state.selected_device_name}\n"
+                f"{self.state.selected_device_address}\n\n"
+                f"JK currently reports: {current_text}\n"
+                f"Independent reference: {reference:.3f} A\n\n"
+                f"Register: 0x67, length: 4, raw value: {round(reference * 1000)}\n"
+                f"BLE frame:\n{frame.hex(' ').upper()}\n\n"
+                "OpenJK will save an automatic JSON backup before transmitting.\n\n"
+                "Send this calibration write?"
+            ),
+        )
+        if not confirm:
+            return
+
+        backups = Path.cwd() / "backups"
+        backups.mkdir(exist_ok=True)
+        serial = (
+            self.state.device_info.get("serial_number")
+            or self.state.selected_device_name
+            or "jkbms"
+        )
+        safe_serial = "".join(
+            ch if ch.isalnum() or ch in "-_" else "_" for ch in str(serial)
+        )
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = backups / f"{safe_serial}_pre_calibration_{stamp}.json"
+        self.state.save_backup(backup_path)
+
+        self.cal_status_var.set(f"Backup saved to {backup_path}; transmitting...")
+        self.worker.send("write_current_calibration", reference)
 
     def _save_backup(self) -> None:
         if not self.state.settings:
@@ -233,9 +387,28 @@ class OpenJKApp:
                 self.state.live = payload
                 self._display_live(payload)
                 self._display_cells(payload.get("cells", []))
+                current = payload.get("pack_current", 0.0)
+                self.cal_jk_current_var.set(f"{current:+.1f} A")
+                if self.state.selected_device_name and not self.write_in_progress:
+                    self.cal_write_button.configure(state="normal")
                 self.status_var.set(
                     f"Live: {payload.get('pack_voltage', 0):.3f} V, "
-                    f"{payload.get('pack_current', 0):+.3f} A"
+                    f"{current:+.1f} A"
+                )
+            elif kind == "write_started":
+                self.write_in_progress = True
+                self.cal_write_button.configure(state="disabled")
+                self.cal_status_var.set(
+                    f"Writing {payload['reference_current_a']:.3f} A reference; "
+                    "discarding stale telemetry..."
+                )
+            elif kind == "write_completed":
+                self.write_in_progress = False
+                self.cal_write_button.configure(state="normal")
+                current = self.state.live.get("pack_current")
+                suffix = "" if current is None else f" Current telemetry now reads {current:+.1f} A."
+                self.cal_status_var.set(
+                    "Calibration frame sent and fresh telemetry requested." + suffix
                 )
         self.root.after(75, self._drain_events)
 
@@ -243,7 +416,16 @@ class OpenJKApp:
         if payload.get("connected"):
             self.state.selected_device_name = payload.get("name", "")
             self.state.selected_device_address = payload.get("address", "")
+            self.cal_device_var.set(
+                f"{self.state.selected_device_name}  "
+                f"({self.state.selected_device_address})"
+            )
+            self.cal_status_var.set(
+                "Connected. Wait for live current, then enter the independent reference current."
+            )
         else:
+            self.cal_device_var.set("Not connected")
+            self.cal_write_button.configure(state="disabled")
             self.status_var.set("Disconnected")
 
     def _show_devices(self, devices: list[DeviceRow]) -> None:
