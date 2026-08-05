@@ -9,3 +9,5 @@ openjk_raw_*.log
 *_openjk_backup_*.json
 
 backups/
+
+transactions/

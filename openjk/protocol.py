@@ -27,17 +27,13 @@ def make_command(command: int, counter: int = 0) -> bytes:
 
 
 def make_write_command(register: int, value: int, length: int = 4) -> bytes:
-    """Build a JK BLE holding-register write frame.
-
-    Frame layout follows the JK BLE protocol used by the JK02/PB family:
-      AA 55 90 EB | register | length | value LE (4 bytes) | zeros | checksum
-    """
+    """Build a JK BLE holding-register write frame."""
     if not 0 <= register <= 0xFF:
         raise ValueError("register must be in the range 0x00..0xFF")
     if length not in (1, 2, 4):
         raise ValueError("length must be 1, 2, or 4 bytes")
-    max_value = (1 << (length * 8)) - 1
-    if not 0 <= value <= max_value:
+    maximum = (1 << (length * 8)) - 1
+    if not 0 <= value <= maximum:
         raise ValueError(f"value does not fit in {length} byte(s)")
 
     frame = bytearray(20)
@@ -49,24 +45,76 @@ def make_write_command(register: int, value: int, length: int = 4) -> bytes:
     return bytes(frame)
 
 
-CURRENT_CALIBRATION_REGISTER_JK02_32S = 0x67
-CURRENT_CALIBRATION_FACTOR = 1000.0
+@dataclass(frozen=True)
+class WritableParameter:
+    key: str
+    label: str
+    register: int
+    factor: float
+    length: int
+    minimum: float
+    maximum: float
+    unit: str
+    step: float
+
+    def encode(self, value: float) -> tuple[int, bytes]:
+        if not self.minimum <= value <= self.maximum:
+            raise ValueError(
+                f"{self.label} must be between {self.minimum:g} and "
+                f"{self.maximum:g} {self.unit}"
+            )
+        raw = round(value * self.factor)
+        return raw, make_write_command(self.register, raw, self.length)
 
 
-def make_current_calibration_command(reference_current_a: float) -> bytes:
-    """Build the JK02_32S current-calibration write.
-
-    The value is the independently measured current actually flowing through
-    the selected BMS, expressed in amperes and encoded in milliamperes.
-    """
-    if not 0.0 <= reference_current_a <= 1000.0:
-        raise ValueError("reference current must be between 0 and 1000 A")
-    raw = round(reference_current_a * CURRENT_CALIBRATION_FACTOR)
-    return make_write_command(
-        CURRENT_CALIBRATION_REGISTER_JK02_32S,
-        raw,
-        length=4,
-    )
+# First write-capable release: deliberately small, reversible whitelist for
+# JK02_32S / PB / V19 hardware.
+SAFE_WRITABLE_PARAMETERS: dict[str, WritableParameter] = {
+    "start_balance_voltage": WritableParameter(
+        "start_balance_voltage",
+        "Start balance voltage",
+        0x22,
+        1000.0,
+        4,
+        1.20,
+        4.25,
+        "V",
+        0.01,
+    ),
+    "soc_100_voltage": WritableParameter(
+        "soc_100_voltage",
+        "SOC 100% voltage",
+        0x07,
+        1000.0,
+        4,
+        0.003,
+        3.650,
+        "V",
+        0.001,
+    ),
+    "cell_rcv": WritableParameter(
+        "cell_rcv",
+        "Cell request charge voltage",
+        0x09,
+        1000.0,
+        4,
+        0.003,
+        3.650,
+        "V",
+        0.001,
+    ),
+    "cell_rfv": WritableParameter(
+        "cell_rfv",
+        "Cell request float voltage",
+        0x0A,
+        1000.0,
+        4,
+        0.003,
+        3.650,
+        "V",
+        0.001,
+    ),
+}
 
 
 GET_SETTINGS = make_command(0x96)

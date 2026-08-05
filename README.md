@@ -1,65 +1,76 @@
-# OpenJK v0.3.0
+# OpenJK v0.3.1
 
 OpenJK is an open-source protocol engine and engineering toolkit for JK Smart BMS systems over Bluetooth LE.
 
-## First guarded write
+## Milestone: first verified writes
 
-v0.3 introduces one deliberately narrow write path:
+This release adds a deliberately small whitelist of reversible voltage settings for JK02_32S / PB / V19 hardware:
 
-**JK02_32S / PB / V19 current calibration, holding register `0x67`.**
+| Setting | Register | Scale |
+|---|---:|---:|
+| Start balance voltage | `0x22` | 1000 counts/V |
+| SOC 100% voltage | `0x07` | 1000 counts/V |
+| Cell request charge voltage | `0x09` | 1000 counts/V |
+| Cell request float voltage | `0x0A` | 1000 counts/V |
 
-The entered value is the independently measured current actually flowing through the selected BMS. It is not a gain coefficient or an offset. OpenJK encodes the value in milliamperes as a four-byte little-endian register write.
+All writes use a four-byte little-endian value in the standard 20-byte JK BLE holding-register frame.
 
-Before transmission, OpenJK:
+## Safety transaction
 
-1. Requires a live connection and a settings frame.
-2. Shows the exact selected BMS identity.
-3. Shows the JK current and proposed reference current.
-4. Shows the exact register, raw value, and 20-byte BLE frame.
-5. Requires explicit confirmation.
-6. Saves an automatic JSON backup in `backups/`.
-7. Logs the transmitted frame and all replies.
-8. Waits for stale telemetry to clear and requests fresh data.
+OpenJK performs the exact reversible experiment requested:
 
-All protection, MOSFET, balancing, temperature, capacity, and voltage settings remain read-only in this release.
+1. Connect to the intended BMS.
+2. Read all settings.
+3. Choose one whitelisted voltage.
+4. Save a complete JSON backup.
+5. Show the exact old value, new value, register, raw value, and BLE frame.
+6. Require explicit confirmation.
+7. Send the write using BLE write-without-response.
+8. Request two fresh settings frames.
+9. Verify the value by readback.
+10. Offer **Restore original value**.
+11. Verify the restoration by readback.
+
+Every transaction is appended to:
+
+```text
+transactions/openjk_write_transactions.log
+```
+
+Pre-write backups are saved under:
+
+```text
+backups/
+```
+
+## Recommended first test
+
+Use **Start balance voltage** and make a tiny reversible change:
+
+```text
+3.400 V → 3.410 V
+```
+
+After OpenJK reports `PASS`, click **Restore original value** and confirm a second `PASS`.
 
 ## Install
 
-```powershell
-python -m pip install -r requirements.txt
-```
-
-## Run
+No new dependencies were added. If v0.2.1 already runs:
 
 ```powershell
 python openjk.py
 ```
 
-## Current-calibration procedure
+For a fresh installation:
 
-1. Connect to the intended BMS.
-2. Verify its advertised name (`-00` master or `-01` slave).
-3. Wait for live telemetry.
-4. Measure the current through that individual BMS using the Hantek/reference meter.
-5. Open **Current calibration**.
-6. Enter the independent measurement in amperes.
-7. Review the confirmation carefully.
-8. Write.
-9. Wait for fresh telemetry and compare again.
+```powershell
+python -m pip install -r requirements.txt
+python openjk.py
+```
 
-Because your BMS current telemetry updates in roughly 0.1 A steps and the system current changes rapidly, calibration is best performed under substantial, reasonably stable charge or discharge current.
+## Important limitations
 
-## Protocol basis
-
-The BLE holding-register frame and the JK02_32S current-calibration register map are based on the community-maintained `syssi/esphome-jk-bms` protocol implementation:
-
-- Register: `0x67`
-- Length: `4`
-- Scale: `1000` raw counts per ampere
-- Frame: `AA 55 90 EB`, register, length, little-endian value, zero padding, additive checksum
-
-OpenJK's Python transport, transaction safeguards, backups, logging, and user interface are implemented independently for this project.
-
-## Important
-
-This is the first write-capable test release. Use it only while watching the selected BMS and an independent reference instrument. Preserve the raw log if the BMS rejects the command or behaves unexpectedly.
+- This release targets the JK02_32S protocol used by your PB/V19 BMS.
+- It does not expose protection thresholds, current limits, MOS controls, cell count, communication protocols, or calibration writes.
+- JK uses BLE write-without-response. OpenJK therefore treats fresh settings readback, not the host write call, as proof of success.
+- If verification fails, OpenJK stops and does not attempt an automatic rollback.

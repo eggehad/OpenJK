@@ -19,7 +19,7 @@ from .protocol import (
     GET_SETTINGS,
     FrameAssembler,
     decode_frame,
-    make_current_calibration_command,
+    SAFE_WRITABLE_PARAMETERS,
 )
 
 
@@ -107,8 +107,8 @@ class BleWorker:
                     await self._write(GET_SETTINGS)
                 elif command == "read_device":
                     await self._write(GET_DEVICE_INFO)
-                elif command == "write_current_calibration":
-                    await self._write_current_calibration(float(payload))
+                elif command == "write_parameter":
+                    await self._write_parameter(payload)
                 elif command == "stop":
                     self.running = False
                     await self._disconnect()
@@ -206,29 +206,33 @@ class BleWorker:
             await asyncio.sleep(10.0)
             await self._write(GET_SETTINGS)
 
-    async def _write_current_calibration(self, reference_current_a: float) -> None:
-        if not self.client or not self.client.is_connected:
-            raise RuntimeError("Not connected")
+    async def _write_parameter(self, payload: dict[str, Any]) -> None:
+        key = str(payload["key"])
+        value = float(payload["value"])
+        if key not in SAFE_WRITABLE_PARAMETERS:
+            raise ValueError(f"Parameter is not write-enabled: {key}")
 
-        frame = make_current_calibration_command(reference_current_a)
-        self._emit("write_started", {
-            "kind": "current_calibration",
-            "reference_current_a": reference_current_a,
-            "frame": frame,
-        })
+        definition = SAFE_WRITABLE_PARAMETERS[key]
+        raw_value, frame = definition.encode(value)
+        self._emit(
+            "write_started",
+            {
+                "key": key,
+                "label": definition.label,
+                "value": value,
+                "raw_value": raw_value,
+                "register": definition.register,
+                "frame": frame,
+            },
+        )
+
+        # ESPHome's proven implementation uses a BLE write-without-response.
+        # Verification therefore comes from a fresh 0x01 settings frame.
         await self._write(frame)
-
-        # JK replies with a short acknowledgement and then resumes telemetry.
-        # Do not claim success merely because the host write completed. Allow
-        # stale BLE telemetry to drain, then request a fresh settings/status
-        # cycle and report the post-write current to the UI.
-        await asyncio.sleep(3.0)
-        await self._write(GET_SETTINGS)
         await asyncio.sleep(1.0)
-        self._emit("write_completed", {
-            "kind": "current_calibration",
-            "reference_current_a": reference_current_a,
-        })
+        await self._write(GET_SETTINGS)
+        await asyncio.sleep(1.5)
+        await self._write(GET_SETTINGS)
 
     async def _write(self, payload: bytes) -> None:
         if not self.client or not self.client.is_connected:
