@@ -1,6 +1,25 @@
-# OpenJK v0.3.1
+# OpenJK v0.3.2
 
 OpenJK is an open-source protocol engine and engineering toolkit for JK Smart BMS systems over Bluetooth LE.
+
+## v0.3.2: rejected-write handling
+
+JK BMS firmware sometimes ignores a valid BLE write. OpenJK now treats a
+readback mismatch as **NOT ACCEPTED**, not as a mysterious generic failure.
+
+For every write it now:
+
+1. Sends the value.
+2. Requests fresh settings.
+3. Verifies the readback.
+4. If unchanged, reports the rejected attempt clearly.
+5. Waits 1.5 seconds and retries automatically.
+6. Stops after three attempts.
+7. Reports either `PASS after N attempts` or `FAILED after 3 attempts`.
+8. Logs `NOT_ACCEPTED`, `RETRY_SCHEDULED`, and the final result.
+
+This matches the observed behavior in which the same valid value may fail once
+and stick on a later transmission.
 
 ## Milestone: first verified writes
 

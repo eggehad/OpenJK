@@ -12,7 +12,7 @@ from typing import Any
 from .engine import BMSState, BleWorker, DeviceRow
 from .protocol import SETTINGS, settings_rows
 
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 
 
 class OpenJKApp:
@@ -28,6 +28,7 @@ class OpenJKApp:
         self.state = BMSState()
         self.pending_write: dict[str, Any] | None = None
         self.restore_value: dict[str, Any] | None = None
+        self.max_write_attempts = 3
 
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.raw_log = Path.cwd() / f"openjk_raw_{stamp}.log"
@@ -272,8 +273,8 @@ class OpenJKApp:
         ttk.Label(
             outer,
             text=(
-                "v0.3.1 enables four guarded JK02_32S voltage writes with "
-                "automatic backup, readback verification, and one-click restore."
+                "v0.3.2 retries rejected writes up to three times, reports each "
+                "attempt clearly, and still verifies every accepted value."
             ),
         ).pack(anchor="w", pady=(8, 0))
 
@@ -385,6 +386,8 @@ class OpenJKApp:
             "frame": frame,
             "backup_path": str(backup_path),
             "started_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "attempt": 1,
+            "max_attempts": self.max_write_attempts,
         }
         self.restore_value = {
             "key": key,
@@ -407,30 +410,79 @@ class OpenJKApp:
 
         tolerance = 0.5 / float(pending["factor"])
         passed = abs(float(actual) - float(pending["expected"])) <= tolerance
-        result = "PASS" if passed else "FAIL"
+
         self._append_transaction_log(
             "VERIFY",
             {
                 **pending,
                 "actual": float(actual),
             },
-            result=result,
+            result="PASS" if passed else "NOT_ACCEPTED",
         )
 
         if passed:
+            attempts = int(pending.get("attempt", 1))
             self.write_status_var.set(
-                f"PASS: {pending['label']} read back as "
-                f"{float(actual):.3f} {pending['unit']}. "
+                f"PASS after {attempts} attempt"
+                f"{'' if attempts == 1 else 's'}: {pending['label']} "
+                f"read back as {float(actual):.3f} {pending['unit']}. "
                 "The original value is available for restoration."
             )
             self.restore_button.configure(state="normal")
-            self.write_current_var.set(f"{float(actual):.3f} {pending['unit']}")
-        else:
-            self.write_status_var.set(
-                f"FAIL: expected {float(pending['expected']):.3f} "
-                f"{pending['unit']}, read back {float(actual):.3f} "
-                f"{pending['unit']}. No further write was attempted."
+            self.write_current_var.set(
+                f"{float(actual):.3f} {pending['unit']}"
             )
+            self.pending_write = None
+            self.write_button.configure(state="normal")
+            return
+
+        attempt = int(pending.get("attempt", 1))
+        maximum = int(pending.get("max_attempts", self.max_write_attempts))
+
+        if attempt < maximum:
+            next_attempt = attempt + 1
+            pending["attempt"] = next_attempt
+            self.write_status_var.set(
+                f"NOT ACCEPTED on attempt {attempt}/{maximum}: expected "
+                f"{float(pending['expected']):.3f} {pending['unit']}, "
+                f"read back {float(actual):.3f} {pending['unit']}. "
+                f"Retrying automatically in 1.5 seconds..."
+            )
+            self._append_transaction_log(
+                "RETRY",
+                {
+                    **pending,
+                    "actual": float(actual),
+                    "next_attempt": next_attempt,
+                },
+                result="RETRY_SCHEDULED",
+            )
+            self.root.after(
+                1500,
+                lambda: self.worker.send(
+                    "write_parameter",
+                    {
+                        "key": pending["key"],
+                        "value": pending["expected"],
+                    },
+                ),
+            )
+            return
+
+        self.write_status_var.set(
+            f"FAILED after {maximum} attempts: expected "
+            f"{float(pending['expected']):.3f} {pending['unit']}, "
+            f"read back {float(actual):.3f} {pending['unit']}. "
+            "The BMS did not accept the value. No additional write was sent."
+        )
+        self._append_transaction_log(
+            "FINAL",
+            {
+                **pending,
+                "actual": float(actual),
+            },
+            result="FAILED_AFTER_RETRIES",
+        )
         self.pending_write = None
         self.write_button.configure(state="normal")
 
@@ -469,6 +521,8 @@ class OpenJKApp:
             "frame": frame,
             "backup_path": "pre-write backup already saved",
             "started_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "attempt": 1,
+            "max_attempts": self.max_write_attempts,
         }
         self.restore_button.configure(state="disabled")
         self.write_button.configure(state="disabled")
@@ -552,8 +606,14 @@ class OpenJKApp:
                 self._check_pending_write(payload)
                 self.status_var.set(f"Settings received: {len(settings_rows(payload))} decoded values")
             elif kind == "write_started":
+                attempt = (
+                    self.pending_write.get("attempt", 1)
+                    if self.pending_write
+                    else 1
+                )
                 self.write_status_var.set(
-                    f"Sent {payload['label']} = {payload['value']:.3f}; "
+                    f"Attempt {attempt}/{self.max_write_attempts}: sent "
+                    f"{payload['label']} = {payload['value']:.3f}; "
                     "waiting for fresh settings readback..."
                 )
                 self._append_transaction_log(
