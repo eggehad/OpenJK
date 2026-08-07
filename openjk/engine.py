@@ -270,7 +270,9 @@ class BleWorker:
 
     def _notification(self, _sender: Any, data: bytearray) -> None:
         chunk = bytes(data)
-        self._emit("rx_chunk", chunk)
+        # v0.4.4: do not send every BLE fragment through the GUI/log queue.
+        # Assembled RX frames retain the complete protocol bytes and are sufficient
+        # for normal diagnostics while avoiding duplicate high-volume logging.
         for frame in self.assembler.feed(chunk):
             self._emit("rx_frame", frame)
             try:

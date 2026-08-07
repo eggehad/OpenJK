@@ -1,56 +1,36 @@
-# OpenJK v0.4.1
+# OpenJK v0.4.4
 
 OpenJK is an open-source engineering workstation for JK Smart BMS systems over Bluetooth LE.
 
-## v0.4.1 cell-view refinement
-
-The 16 JK BMS cell channels are displayed as 16 parallel-pair blocks representing
-32 physical cells: `1|2, 3|4, ... 31|32`.  All blocks remain in one horizontal
-row, with a small mechanical midpoint gap between physical cells 16 and 17.
-
-The cell bodies are deliberately neutral.  A segmented color strip directly below
-them carries the quantitative color information and uses an approximately 25-second
-exponential fade so normal sub-millivolt sample jitter does not flash the display.
-The numerical voltage and deviation remain live.
-
-Cell-view keyboard modes:
-
-- **D** — deviation from pack average
-- **V** — absolute voltage
-- **R** — wire resistance
-- **H** — change in cell deviation over roughly 60 seconds
-
-Keyboard shortcuts are ignored while focus is in an editable control.
-
-
 ## Milestone: the battery becomes visible
 
-v0.4.0 adds a live physical heat map and a time-lapse recorder.
+v0.4.4 keeps the bounded GUI event drain and dual deviation display from v0.4.3, and fixes Safe Writes numeric precision so values are displayed and prefilled at the precision implied by each parameter step (for example 3.35 V is no longer rounded to 3.4 V).
 
 ### Physical pack view
 
-A 16-channel JK BMS in this installation represents 16 parallel cell groups, or
-32 physical cells.  OpenJK renders each BMS channel as one split compound block:
+A 16-channel JK BMS is shown as sixteen compound blocks representing the 32 physical cells in parallel pairs:
 
 ```text
-1|2  3|4  5|6  ...  15|16     17|18  19|20  ...  31|32
+1|2  3|4  5|6 ... 15|16    17|18  19|20 ... 31|32
 ```
 
-The small center gap marks the physical 16/17 battery-half boundary while keeping
-the electrical/color progression visually continuous.  Each block shows one shared
-BMS voltage and deviation because the two physical cells in the block are parallel.
-The highest BMS group has a red outline and the lowest has a blue outline.
+The small midpoint gap marks the physical 16/17 battery-half boundary while preserving one continuous left-to-right electrical view. Each block shows the physical pair, live group voltage, and live deviation from pack average. Highest and lowest groups retain red/blue outlines.
 
-Hovering a block shows its BMS group, physical-cell pair, voltage, deviation, and
-wire resistance.
+### Dual deviation display
 
-### Color modes
+Under the cells are two complementary views:
 
-- **Deviation**: colors cells by millivolts above or below the pack average
-- **Absolute voltage**: auto-ranges over the current pack voltage span
-- **Wire resistance**: auto-ranges over the reported wire-resistance values
+- **signed bars**: live deviation from pack average; positive rises above zero and negative falls below zero
+- **color-memory strip**: the selected D/V/R/H metric with an approximately 25-second exponential fade
 
-The Deviation mode includes an adjustable band width in millivolts.
+The **Band (mV)** control sets the full-scale ± range of the signed deviation bars and the fixed color range in Deviation/Trend modes. Bars are deliberately neutral with only a small colored tip, so geometry carries the quantitative information and color remains secondary.
+
+Keyboard modes for the slow color-memory strip:
+
+- **D** Deviation
+- **V** Absolute voltage
+- **R** Wire resistance
+- **H** 60-second deviation drift
 
 ### Continuous history capture
 
@@ -110,3 +90,8 @@ python openjk.py
 
 Existing v0.3.3 installations only need the new files copied over the working
 repository.
+
+
+## v0.4.4 responsiveness / logging note
+
+The GUI event drain remains bounded so continuous BLE traffic cannot monopolize Tk/Windows message processing. Complete assembled RX frames are logged, but individual BLE RX fragments are no longer duplicated into the raw log. The GUI diagnostic file is sparse and is created only when OpenJK sees an error, a GUI call slower than 100 ms, or a significant event-queue backlog.

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from decimal import Decimal
 import json
 import queue
 import time
@@ -13,7 +14,7 @@ from typing import Any
 from .engine import BMSState, BleWorker, DeviceRow
 from .protocol import SETTINGS, settings_rows
 
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.4.4"
 
 
 class OpenJKApp:
@@ -52,6 +53,9 @@ class OpenJKApp:
 
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.raw_log = Path.cwd() / f"openjk_raw_{stamp}.log"
+        self.gui_diag_log = Path.cwd() / f"openjk_gui_diag_{stamp}.log"
+        self.gui_drain_cycles = 0
+        self.gui_events_processed = 0
 
         self._build_ui()
         self._bind_cell_mode_keys()
@@ -401,8 +405,8 @@ class OpenJKApp:
         ttk.Label(
             outer,
             text=(
-                "v0.4.0 adds the physical serpentine heat map and one-second "
-                "cell-history capture with interactive time-lapse playback."
+                "v0.4.4 keeps the bounded GUI event drain, reduces routine logging, "
+                "and combines live signed deviation bars with the slow color-memory strip."
             ),
         ).pack(anchor="w", pady=(8, 0))
 
@@ -445,7 +449,7 @@ class OpenJKApp:
             self.write_new_var.set("1" if bool(value) else "0")
             self.write_unit_var.set("0 = Off, 1 = On")
         else:
-            decimals = 3 if definition.step < 0.01 else (1 if definition.step < 1 else 0)
+            decimals = max(0, -Decimal(str(definition.step)).as_tuple().exponent)
             self.write_current_var.set(
                 f"{float(value):.{decimals}f} {definition.unit}".strip()
             )
@@ -727,71 +731,129 @@ class OpenJKApp:
         self.status_var.set(f"Backup saved: {filename}")
 
     def _drain_events(self) -> None:
-        while True:
+        # Keep GUI work bounded so a continuous BLE stream can never monopolize
+        # Tk/Windows message processing.  v0.4.4 keeps the v0.4.2 fix but only
+        # writes diagnostics when something is actually abnormal.
+        cycle_start = time.perf_counter()
+        processed = 0
+        max_events = 32
+        max_seconds = 0.012
+        self.gui_drain_cycles += 1
+
+        while processed < max_events and (time.perf_counter() - cycle_start) < max_seconds:
             try:
                 kind, payload = self.events.get_nowait()
             except queue.Empty:
                 break
 
-            if kind == "status":
-                self.status_var.set(str(payload))
-            elif kind == "error":
-                self.status_var.set(str(payload))
-                messagebox.showerror("OpenJK error", str(payload))
-            elif kind == "devices":
-                self._show_devices(payload)
-            elif kind == "connected":
-                self._handle_connected(payload)
-            elif kind == "tx":
-                self._log("TX", payload)
-            elif kind == "rx_chunk":
-                self._log("RX-CHUNK", payload)
-            elif kind == "rx_frame":
-                self._log(f"RX-FRAME type=0x{payload[4]:02X} len={len(payload)}", payload)
-            elif kind == "settings":
-                self.state.settings = payload
-                self.state.last_update = dt.datetime.now().isoformat(timespec="seconds")
-                self._display_settings(payload)
-                self.backup_button.configure(state="normal")
-                self._refresh_write_panel()
-                self._check_pending_write(payload)
-                self.status_var.set(f"Settings received: {len(settings_rows(payload))} decoded values")
-            elif kind == "write_started":
-                attempt = (
-                    self.pending_write.get("attempt", 1)
-                    if self.pending_write
-                    else 1
-                )
-                self.write_status_var.set(
-                    f"Attempt {attempt}/{self.max_write_attempts}: sent "
-                    f"{payload['label']} = {payload['value']:.3f}; "
-                    "waiting for fresh settings readback..."
-                )
-                self._append_transaction_log(
-                    "TX",
-                    payload,
-                    result="SENT; verification pending",
-                )
-            elif kind == "device_info":
-                self.state.device_info = payload
-                self._display_identity(payload)
-                self.status_var.set("Device identity received")
-            elif kind == "live":
-                self.state.live = payload
-                self._display_live(payload)
-                cells = payload.get("cells", [])
-                self.latest_cells = [dict(cell) for cell in cells]
-                self._record_cell_trend_sample(self.latest_cells)
-                if not self.history_samples:
-                    self.display_cells = [dict(cell) for cell in cells]
-                    self._draw_cell_map()
-                if self.history_enabled.get():
-                    self._capture_history_sample(payload)
-                self.status_var.set(
-                    f"Live: {payload.get('pack_voltage', 0):.3f} V, "
-                    f"{payload.get('pack_current', 0):+.1f} A"
-                )
-        self.root.after(75, self._drain_events)
+            event_start = time.perf_counter()
+            try:
+                self._handle_gui_event(kind, payload)
+            except Exception as exc:
+                self._diag(f"EVENT ERROR kind={kind} {type(exc).__name__}: {exc}")
+                raise
+            finally:
+                elapsed_ms = (time.perf_counter() - event_start) * 1000.0
+                processed += 1
+                self.gui_events_processed += 1
+                if elapsed_ms >= 100.0:
+                    self._diag(
+                        f"SLOW EVENT kind={kind} elapsed={elapsed_ms:.3f}ms "
+                        f"queue={self.events.qsize()}"
+                    )
+
+        cycle_ms = (time.perf_counter() - cycle_start) * 1000.0
+        remaining = self.events.qsize()
+        if cycle_ms >= 50.0 or remaining >= 64:
+            self._diag(
+                f"GUI BACKLOG cycle={self.gui_drain_cycles} processed={processed} "
+                f"elapsed={cycle_ms:.3f}ms remaining={remaining}"
+            )
+
+        self.root.after(1 if remaining else 75, self._drain_events)
+
+    def _handle_gui_event(self, kind: str, payload: Any) -> None:
+        if kind == "status":
+            self.status_var.set(str(payload))
+        elif kind == "error":
+            self.status_var.set(str(payload))
+            messagebox.showerror("OpenJK error", str(payload))
+        elif kind == "devices":
+            self._show_devices(payload)
+        elif kind == "connected":
+            self._handle_connected(payload)
+        elif kind == "tx":
+            self._log("TX", payload)
+        elif kind == "rx_chunk":
+            # Retained for compatibility with older workers, but intentionally
+            # ignored in v0.4.4.  Complete RX-FRAME records contain the useful
+            # protocol bytes without duplicating every BLE fragment.
+            pass
+        elif kind == "rx_frame":
+            self._log(f"RX-FRAME type=0x{payload[4]:02X} len={len(payload)}", payload)
+        elif kind == "settings":
+            self.state.settings = payload
+            self.state.last_update = dt.datetime.now().isoformat(timespec="seconds")
+            self._timed_gui_call("settings.display", self._display_settings, payload)
+            self.backup_button.configure(state="normal")
+            self._timed_gui_call("settings.refresh_write", self._refresh_write_panel)
+            self._timed_gui_call("settings.pending_write", self._check_pending_write, payload)
+            self.status_var.set(f"Settings received: {len(settings_rows(payload))} decoded values")
+        elif kind == "write_started":
+            attempt = (
+                self.pending_write.get("attempt", 1)
+                if self.pending_write
+                else 1
+            )
+            self.write_status_var.set(
+                f"Attempt {attempt}/{self.max_write_attempts}: sent "
+                f"{payload['label']} = {payload['value']:.3f}; "
+                "waiting for fresh settings readback..."
+            )
+            self._append_transaction_log(
+                "TX",
+                payload,
+                result="SENT; verification pending",
+            )
+        elif kind == "device_info":
+            self.state.device_info = payload
+            self._timed_gui_call("identity.display", self._display_identity, payload)
+            self.status_var.set("Device identity received")
+        elif kind == "live":
+            self.state.live = payload
+            self._timed_gui_call("live.display", self._display_live, payload)
+            cells = payload.get("cells", [])
+            self.latest_cells = [dict(cell) for cell in cells]
+            self._record_cell_trend_sample(self.latest_cells)
+            if not self.history_samples:
+                self.display_cells = [dict(cell) for cell in cells]
+                self._timed_gui_call("live.draw_cells", self._draw_cell_map)
+            if self.history_enabled.get():
+                self._capture_history_sample(payload)
+            self.status_var.set(
+                f"Live: {payload.get('pack_voltage', 0):.3f} V, "
+                f"{payload.get('pack_current', 0):+.1f} A"
+            )
+
+    def _timed_gui_call(self, label: str, function, *args, **kwargs):
+        started = time.perf_counter()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            if elapsed_ms >= 100.0:
+                self._diag(f"SLOW GUI {label} elapsed={elapsed_ms:.3f}ms")
+
+    def _diag(self, message: str) -> None:
+        # Sparse field diagnostics only.  Normal operation writes nothing here;
+        # the file is created only if an error, >100 ms GUI call, or queue backlog
+        # is observed.
+        timestamp = dt.datetime.now().isoformat(timespec="milliseconds")
+        try:
+            with self.gui_diag_log.open("a", encoding="utf-8") as handle:
+                handle.write(f"{timestamp} {message}\n")
+        except OSError:
+            pass
 
     def _handle_connected(self, payload: dict[str, Any]) -> None:
         if payload.get("connected"):
@@ -975,6 +1037,7 @@ class OpenJKApp:
         low_number = int(min(cells, key=lambda item: float(item["voltage"]))["number"])
         high_number = int(max(cells, key=lambda item: float(item["voltage"]))["number"])
 
+        # Color memory follows the selected mode and is deliberately slow.
         raw_metrics = {
             int(cell["number"]): self._cell_metric(cell, average) for cell in cells
         }
@@ -989,46 +1052,73 @@ class OpenJKApp:
             if abs(metric_max - metric_min) < 1e-12:
                 metric_max = metric_min + 1.0
 
+        # The signed bars always show CURRENT deviation from pack average,
+        # independent of the selected color-memory mode.
+        bar_band = max(float(self.cell_band_mv.get()), 0.5)
+
         margin_x = 34
-        top = 56
+        top = 48
         block_gap = 4
         midpoint_gap = 22
         count = len(cells)
-        # Sixteen JK channels represent sixteen parallel pairs, i.e. 32 physical cells.
-        # Keep all groups in one row so the eye can follow color continuously; only the
-        # mechanical 16/17 midpoint gets a small visual break.
         total_gaps = max(0, count - 1) * block_gap + (midpoint_gap if count > 8 else 0)
         available_w = width - 2 * margin_x - total_gaps
         block_w = max(34.0, available_w / max(count, 1))
-        block_h = max(76.0, min(104.0, height * 0.34))
-        strip_y0 = top + block_h + 10
-        strip_h = 20
+        block_h = max(72.0, min(96.0, height * 0.28))
+
+        bar_top = top + block_h + 12
+        bar_h = max(64.0, min(94.0, height * 0.26))
+        bar_center = bar_top + bar_h / 2
+        strip_y0 = bar_top + bar_h + 8
+        strip_h = 12
 
         canvas.create_text(
-            margin_x, 20, text="Battery cell map", anchor="w",
+            margin_x, 18, text="Battery cell map", anchor="w",
             fill="#1f2933", font=("Segoe UI", 12, "bold"),
         )
         canvas.create_text(
-            width - margin_x, 20,
-            text=f"{count} BMS groups / {count * 2} physical cells   •   {mode}",
+            width - margin_x, 18,
+            text=f"{count} BMS groups / {count * 2} physical cells   •   color: {mode}",
             anchor="e", fill="#66717e", font=("Segoe UI", 9),
         )
 
-        self.cell_hitboxes = []
+        # Precompute the x positions so the zero line and all bars share exactly
+        # the same geometry as the compound-cell row above.
+        positions: list[tuple[dict[str, Any], float, float]] = []
         x = margin_x
         for index, cell in enumerate(cells):
-            number = int(cell["number"])
             if index == 8:
-                # Physical split between cells 16 and 17 without breaking the color flow.
+                x += midpoint_gap
+            positions.append((cell, x, x + block_w))
+            x += block_w + block_gap
+
+        zero_x0 = positions[0][1]
+        zero_x1 = positions[-1][2]
+        canvas.create_line(zero_x0, bar_center, zero_x1, bar_center, fill="#77818c", width=1)
+        canvas.create_text(
+            margin_x - 5, bar_top, text=f"+{bar_band:g}", anchor="e",
+            fill="#66717e", font=("Consolas", 7),
+        )
+        canvas.create_text(
+            margin_x - 5, bar_center, text="0", anchor="e",
+            fill="#66717e", font=("Consolas", 7),
+        )
+        canvas.create_text(
+            margin_x - 5, bar_top + bar_h, text=f"-{bar_band:g}", anchor="e",
+            fill="#66717e", font=("Consolas", 7),
+        )
+
+        self.cell_hitboxes = []
+        for index, (cell, x0, x1) in enumerate(positions):
+            number = int(cell["number"])
+            y0, y1 = top, top + block_h
+
+            if index == 8:
+                split_x = x0 - midpoint_gap / 2
                 canvas.create_line(
-                    x + midpoint_gap / 2, top - 8,
-                    x + midpoint_gap / 2, strip_y0 + strip_h + 7,
+                    split_x, top - 7, split_x, strip_y0 + strip_h + 5,
                     fill="#a9b0b8", dash=(2, 4),
                 )
-                x += midpoint_gap
-
-            x0, x1 = x, x + block_w
-            y0, y1 = top, top + block_h
 
             outline = "#59636e"
             outline_width = 1
@@ -1037,31 +1127,56 @@ class OpenJKApp:
             elif number == low_number:
                 outline, outline_width = "#087fd0", 3
 
-            # Cell bodies stay calm.  Continuous quantitative color lives in the strip below.
             canvas.create_rectangle(
                 x0, y0, x1, y1, fill="#eef1f4", outline=outline, width=outline_width
             )
             pair_a = 2 * number - 1
             pair_b = 2 * number
             canvas.create_text(
-                (x0 + x1) / 2, y0 + 16, text=f"{pair_a} | {pair_b}",
+                (x0 + x1) / 2, y0 + 15, text=f"{pair_a} | {pair_b}",
                 fill="#111820", font=("Segoe UI", 8, "bold"),
             )
             canvas.create_line(
-                (x0 + x1) / 2, y0 + 5, (x0 + x1) / 2, y0 + 27,
+                (x0 + x1) / 2, y0 + 4, (x0 + x1) / 2, y0 + 25,
                 fill="#aab1b8", width=1,
             )
             canvas.create_text(
-                (x0 + x1) / 2, y0 + 47,
+                (x0 + x1) / 2, y0 + 43,
                 text=f"{float(cell['voltage']):.3f}",
                 fill="#111820", font=("Consolas", 10, "bold"),
             )
             delta_mv = (float(cell["voltage"]) - average) * 1000.0
             canvas.create_text(
-                (x0 + x1) / 2, y1 - 13, text=f"{delta_mv:+.1f} mV",
+                (x0 + x1) / 2, y1 - 12, text=f"{delta_mv:+.1f} mV",
                 fill="#25313d", font=("Consolas", 8),
             )
 
+            # Live signed deviation bar.  Positive rises above zero; negative falls below.
+            clipped = max(-bar_band, min(bar_band, delta_mv))
+            half_h = bar_h / 2 - 3
+            magnitude = abs(clipped) / bar_band * half_h
+            bar_w = max(5.0, min(12.0, block_w * 0.24))
+            bx0 = (x0 + x1) / 2 - bar_w / 2
+            bx1 = bx0 + bar_w
+            if clipped >= 0:
+                by0, by1 = bar_center - magnitude, bar_center
+            else:
+                by0, by1 = bar_center, bar_center + magnitude
+            if magnitude > 0.5:
+                canvas.create_rectangle(
+                    bx0, by0, bx1, by1, fill="#747d87", outline=""
+                )
+                # A small colored tip keeps hue as a secondary cue while bar height
+                # remains the dominant quantitative signal.
+                tip = min(4.0, magnitude)
+                frac = (clipped + bar_band) / (2.0 * bar_band)
+                tip_color = self._heat_color(frac)
+                if clipped >= 0:
+                    canvas.create_rectangle(bx0, by0, bx1, by0 + tip, fill=tip_color, outline="")
+                else:
+                    canvas.create_rectangle(bx0, by1 - tip, bx1, by1, fill=tip_color, outline="")
+
+            # Slow color-memory strip: selected metric, approximately 25 s time constant.
             metric = metrics[number]
             fraction = (metric - metric_min) / (metric_max - metric_min)
             canvas.create_rectangle(
@@ -1069,29 +1184,28 @@ class OpenJKApp:
                 fill=self._heat_color(fraction), outline="",
             )
             self.cell_hitboxes.append((x0, y0, x1, strip_y0 + strip_h, number))
-            x = x1 + block_gap
 
         canvas.create_text(
-            margin_x, strip_y0 + strip_h + 16,
-            text="slow color strip • ~25 s fade", anchor="w",
+            margin_x, strip_y0 + strip_h + 14,
+            text="live signed Δ bars  •  slow color memory ~25 s", anchor="w",
             fill="#66717e", font=("Segoe UI", 8),
         )
 
-        # Fixed legend for deviation/trend; auto-ranged legend for voltage/resistance.
-        legend_y = height - 30
-        legend_x0 = margin_x + 60
-        legend_x1 = width - margin_x - 60
-        segments = 80
-        for index in range(segments):
-            xa = legend_x0 + (legend_x1 - legend_x0) * index / segments
-            xb = legend_x0 + (legend_x1 - legend_x0) * (index + 1) / segments
+        # Compact color legend.  Deviation bars use the ±Band scale printed beside them.
+        legend_y = max(strip_y0 + strip_h + 30, height - 24)
+        legend_x0 = margin_x + 80
+        legend_x1 = width - margin_x - 80
+        segments = 64
+        for i in range(segments):
+            xa = legend_x0 + (legend_x1 - legend_x0) * i / segments
+            xb = legend_x0 + (legend_x1 - legend_x0) * (i + 1) / segments
             canvas.create_rectangle(
-                xa, legend_y, xb + 1, legend_y + 10,
-                fill=self._heat_color(index / (segments - 1)), outline="",
+                xa, legend_y, xb + 1, legend_y + 8,
+                fill=self._heat_color(i / (segments - 1)), outline="",
             )
-        canvas.create_text(legend_x0 - 8, legend_y + 5, text="Low", anchor="e",
+        canvas.create_text(legend_x0 - 8, legend_y + 4, text="Low", anchor="e",
                            fill="#4d5965", font=("Segoe UI", 8))
-        canvas.create_text(legend_x1 + 8, legend_y + 5, text="High", anchor="w",
+        canvas.create_text(legend_x1 + 8, legend_y + 4, text="High", anchor="w",
                            fill="#4d5965", font=("Segoe UI", 8))
 
         delta = (high_voltage - low_voltage) * 1000.0
