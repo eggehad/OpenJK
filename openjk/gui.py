@@ -14,7 +14,7 @@ from typing import Any
 from .engine import BMSState, BleWorker, DeviceRow
 from .protocol import SETTINGS, settings_rows
 
-APP_VERSION = "0.4.4"
+APP_VERSION = "0.4.5"
 
 
 class OpenJKApp:
@@ -31,6 +31,8 @@ class OpenJKApp:
         self.pending_write: dict[str, Any] | None = None
         self.restore_value: dict[str, Any] | None = None
         self.max_write_attempts = 3
+        self.write_new_dirty = False
+        self._setting_write_new = False
 
         # Cell laboratory state
         self.latest_cells: list[dict[str, Any]] = []
@@ -335,6 +337,7 @@ class OpenJKApp:
             row=4, column=0, sticky="e", padx=(0, 10), pady=4
         )
         self.write_new_var = tk.StringVar()
+        self.write_new_var.trace_add("write", self._write_new_changed)
         self.write_new_entry = ttk.Entry(
             writes_tab, textvariable=self.write_new_var, width=18, font=("Consolas", 11)
         )
@@ -405,7 +408,7 @@ class OpenJKApp:
         ttk.Label(
             outer,
             text=(
-                "v0.4.4 keeps the bounded GUI event drain, reduces routine logging, "
+                "v0.4.5 keeps the bounded GUI event drain, protects user-edited Safe Write values, "
                 "and combines live signed deviation bars with the slow color-memory strip."
             ),
         ).pack(anchor="w", pady=(8, 0))
@@ -426,10 +429,24 @@ class OpenJKApp:
             return None, None
         return key, SAFE_WRITABLE_PARAMETERS[key]
 
-    def _write_parameter_selected(self, _event=None) -> None:
-        self._refresh_write_panel()
+    def _write_new_changed(self, *_args) -> None:
+        if not self._setting_write_new:
+            self.write_new_dirty = True
 
-    def _refresh_write_panel(self) -> None:
+    def _set_write_new(self, text: str, *, clean: bool = False) -> None:
+        self._setting_write_new = True
+        try:
+            self.write_new_var.set(text)
+        finally:
+            self._setting_write_new = False
+        if clean:
+            self.write_new_dirty = False
+
+    def _write_parameter_selected(self, _event=None) -> None:
+        self.write_new_dirty = False
+        self._refresh_write_panel(initialize_new=True)
+
+    def _refresh_write_panel(self, *, initialize_new: bool = False) -> None:
         key, definition = self._selected_write_definition()
         if not key or not definition:
             self.write_current_var.set("—")
@@ -446,14 +463,16 @@ class OpenJKApp:
         if definition.kind == "bool":
             shown = "On" if bool(value) else "Off"
             self.write_current_var.set(shown)
-            self.write_new_var.set("1" if bool(value) else "0")
+            if initialize_new or not self.write_new_dirty:
+                self._set_write_new("1" if bool(value) else "0", clean=True)
             self.write_unit_var.set("0 = Off, 1 = On")
         else:
             decimals = max(0, -Decimal(str(definition.step)).as_tuple().exponent)
             self.write_current_var.set(
                 f"{float(value):.{decimals}f} {definition.unit}".strip()
             )
-            self.write_new_var.set(f"{float(value):.{decimals}f}")
+            if initialize_new or not self.write_new_dirty:
+                self._set_write_new(f"{float(value):.{decimals}f}", clean=True)
             self.write_unit_var.set(definition.unit)
         enabled = bool(self.state.selected_device_name and self.state.settings)
         self.write_button.configure(state="normal" if enabled else "disabled")
@@ -587,6 +606,13 @@ class OpenJKApp:
             self.write_current_var.set(
                 f"{float(actual):.3f} {pending['unit']}"
             )
+            key, definition = self._selected_write_definition()
+            if key == pending["key"] and definition is not None:
+                if definition.kind == "bool":
+                    self._set_write_new("1" if bool(actual) else "0", clean=True)
+                else:
+                    decimals = max(0, -Decimal(str(definition.step)).as_tuple().exponent)
+                    self._set_write_new(f"{float(actual):.{decimals}f}", clean=True)
             self.pending_write = None
             self.write_button.configure(state="normal")
             return

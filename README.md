@@ -1,10 +1,10 @@
-# OpenJK v0.4.4
+# OpenJK v0.4.3
 
 OpenJK is an open-source engineering workstation for JK Smart BMS systems over Bluetooth LE.
 
 ## Milestone: the battery becomes visible
 
-v0.4.4 keeps the bounded GUI event drain and dual deviation display from v0.4.3, and fixes Safe Writes numeric precision so values are displayed and prefilled at the precision implied by each parameter step (for example 3.35 V is no longer rounded to 3.4 V).
+v0.4.3 keeps the bounded GUI event drain introduced in v0.4.2, removes routine high-volume GUI diagnostics and per-fragment RX logging, and adds a dual deviation display: live signed bars plus a slow color-memory strip.
 
 ### Physical pack view
 
@@ -92,6 +92,10 @@ Existing v0.3.3 installations only need the new files copied over the working
 repository.
 
 
-## v0.4.4 responsiveness / logging note
+## v0.4.3 responsiveness / logging note
 
 The GUI event drain remains bounded so continuous BLE traffic cannot monopolize Tk/Windows message processing. Complete assembled RX frames are logged, but individual BLE RX fragments are no longer duplicated into the raw log. The GUI diagnostic file is sparse and is created only when OpenJK sees an error, a GUI call slower than 100 ms, or a significant event-queue backlog.
+
+
+## v0.4.5 Safe Writes fix
+The New value field is now user-owned while editing. Background settings refreshes update Current value only and no longer overwrite a typed New value. Selecting a parameter initializes New value once; successful verified writes/resores resynchronize it intentionally.
