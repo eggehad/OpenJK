@@ -12,7 +12,7 @@ from typing import Any
 from .engine import BMSState, BleWorker, DeviceRow
 from .protocol import SETTINGS, settings_rows
 
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 
 
 class OpenJKApp:
@@ -181,9 +181,13 @@ class OpenJKApp:
             state="readonly",
             width=38,
         )
+        ordered = sorted(
+            SAFE_WRITABLE_PARAMETERS.items(),
+            key=lambda item: (item[1].category, item[1].label),
+        )
         self.write_parameter_labels = {
-            definition.label: key
-            for key, definition in SAFE_WRITABLE_PARAMETERS.items()
+            f"{definition.category} — {definition.label}": key
+            for key, definition in ordered
         }
         self.write_parameter_combo["values"] = list(self.write_parameter_labels)
         self.write_parameter_combo.grid(row=2, column=1, sticky="w", pady=4)
@@ -273,8 +277,8 @@ class OpenJKApp:
         ttk.Label(
             outer,
             text=(
-                "v0.3.2 retries rejected writes up to three times, reports each "
-                "attempt clearly, and still verifies every accepted value."
+                "v0.3.3 exposes every decoded JK02_32S numeric and control "
+                "setting with the same backup, retry, verification, and restore engine."
             ),
         ).pack(anchor="w", pady=(8, 0))
 
@@ -311,10 +315,18 @@ class OpenJKApp:
             self.write_button.configure(state="disabled")
             return
 
-        self.write_current_var.set(f"{float(value):.3f} {definition.unit}")
-        self.write_unit_var.set(definition.unit)
-        if not self.write_new_var.get():
-            self.write_new_var.set(f"{float(value):.3f}")
+        if definition.kind == "bool":
+            shown = "On" if bool(value) else "Off"
+            self.write_current_var.set(shown)
+            self.write_new_var.set("1" if bool(value) else "0")
+            self.write_unit_var.set("0 = Off, 1 = On")
+        else:
+            decimals = 3 if definition.step < 0.01 else (1 if definition.step < 1 else 0)
+            self.write_current_var.set(
+                f"{float(value):.{decimals}f} {definition.unit}".strip()
+            )
+            self.write_new_var.set(f"{float(value):.{decimals}f}")
+            self.write_unit_var.set(definition.unit)
         enabled = bool(self.state.selected_device_name and self.state.settings)
         self.write_button.configure(state="normal" if enabled else "disabled")
 
@@ -331,7 +343,17 @@ class OpenJKApp:
             return
 
         try:
-            new_value = float(self.write_new_var.get().strip())
+            entered = self.write_new_var.get().strip().lower()
+            if definition.kind == "bool":
+                aliases = {
+                    "0": 0.0, "off": 0.0, "false": 0.0, "no": 0.0,
+                    "1": 1.0, "on": 1.0, "true": 1.0, "yes": 1.0,
+                }
+                if entered not in aliases:
+                    raise ValueError("Enter 0/Off or 1/On for this switch.")
+                new_value = aliases[entered]
+            else:
+                new_value = float(entered)
             raw_value, frame = definition.encode(new_value)
         except ValueError as exc:
             messagebox.showerror("OpenJK", str(exc))
@@ -353,7 +375,12 @@ class OpenJKApp:
                 f"Register: 0x{definition.register:02X}\n"
                 f"Raw value: {raw_value}\n"
                 f"Frame:\n{frame.hex(' ').upper()}\n\n"
-                "OpenJK will save a complete JSON backup, transmit the write, "
+                + (
+                    "CRITICAL SETTING: verify the selected BMS and value carefully.\n"
+                    if definition.critical else ""
+                )
+                + (f"{definition.note}\n" if definition.note else "")
+                + "\nOpenJK will save a complete JSON backup, transmit the write, "
                 "request fresh settings twice, and verify the readback.\n\n"
                 "Proceed?"
             ),

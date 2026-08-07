@@ -27,20 +27,28 @@ def make_command(command: int, counter: int = 0) -> bytes:
 
 
 def make_write_command(register: int, value: int, length: int = 4) -> bytes:
-    """Build a JK BLE holding-register write frame."""
+    """Build a JK BLE holding-register write frame.
+
+    Signed values are encoded using two's complement, which is required for
+    negative temperature thresholds.
+    """
     if not 0 <= register <= 0xFF:
         raise ValueError("register must be in the range 0x00..0xFF")
     if length not in (1, 2, 4):
         raise ValueError("length must be 1, 2, or 4 bytes")
-    maximum = (1 << (length * 8)) - 1
-    if not 0 <= value <= maximum:
+
+    signed = value < 0
+    minimum = -(1 << (length * 8 - 1)) if signed else 0
+    maximum = (1 << (length * 8 - (1 if signed else 0))) - 1
+    if not minimum <= value <= maximum:
         raise ValueError(f"value does not fit in {length} byte(s)")
 
     frame = bytearray(20)
     frame[0:4] = b"\xAA\x55\x90\xEB"
     frame[4] = register
     frame[5] = length
-    frame[6:10] = int(value).to_bytes(4, "little", signed=False)
+    encoded = int(value).to_bytes(length, "little", signed=signed)
+    frame[6 : 6 + length] = encoded
     frame[19] = crc8_sum(frame[:19])
     return bytes(frame)
 
@@ -49,6 +57,7 @@ def make_write_command(register: int, value: int, length: int = 4) -> bytes:
 class WritableParameter:
     key: str
     label: str
+    category: str
     register: int
     factor: float
     length: int
@@ -56,65 +65,107 @@ class WritableParameter:
     maximum: float
     unit: str
     step: float
+    kind: str = "number"
+    critical: bool = False
+    note: str = ""
 
     def encode(self, value: float) -> tuple[int, bytes]:
+        if self.kind == "bool":
+            value = 1.0 if bool(value) else 0.0
         if not self.minimum <= value <= self.maximum:
             raise ValueError(
                 f"{self.label} must be between {self.minimum:g} and "
-                f"{self.maximum:g} {self.unit}"
+                f"{self.maximum:g} {self.unit}".rstrip()
             )
         raw = round(value * self.factor)
         return raw, make_write_command(self.register, raw, self.length)
 
 
-# First write-capable release: deliberately small, reversible whitelist for
-# JK02_32S / PB / V19 hardware.
-SAFE_WRITABLE_PARAMETERS: dict[str, WritableParameter] = {
-    "start_balance_voltage": WritableParameter(
-        "start_balance_voltage",
-        "Start balance voltage",
-        0x22,
-        1000.0,
-        4,
-        1.20,
-        4.25,
-        "V",
-        0.01,
-    ),
-    "soc_100_voltage": WritableParameter(
-        "soc_100_voltage",
-        "SOC 100% voltage",
-        0x07,
-        1000.0,
-        4,
-        0.003,
-        3.650,
-        "V",
-        0.001,
-    ),
-    "cell_rcv": WritableParameter(
-        "cell_rcv",
-        "Cell request charge voltage",
-        0x09,
-        1000.0,
-        4,
-        0.003,
-        3.650,
-        "V",
-        0.001,
-    ),
-    "cell_rfv": WritableParameter(
-        "cell_rfv",
-        "Cell request float voltage",
-        0x0A,
-        1000.0,
-        4,
-        0.003,
-        3.650,
-        "V",
-        0.001,
-    ),
+def _p(
+    key: str,
+    label: str,
+    category: str,
+    register: int,
+    factor: float,
+    length: int,
+    minimum: float,
+    maximum: float,
+    unit: str,
+    step: float,
+    *,
+    kind: str = "number",
+    critical: bool = False,
+    note: str = "",
+) -> WritableParameter:
+    return WritableParameter(
+        key, label, category, register, factor, length,
+        minimum, maximum, unit, step, kind, critical, note
+    )
+
+
+# JK02_32S / PB / V19 holding-register map.
+#
+# This table is the write engine's source of truth. The transaction code does
+# not contain parameter-specific branches.
+WRITABLE_PARAMETERS: dict[str, WritableParameter] = {
+    # Voltage and SOC
+    "smart_sleep_voltage": _p("smart_sleep_voltage", "Smart sleep voltage", "Voltage", 0x01, 1000, 1, 0.003, 0.255, "V", 0.001),
+    "cell_uvp": _p("cell_uvp", "Cell UVP", "Voltage", 0x02, 1000, 4, 1.2, 4.35, "V", 0.001, critical=True),
+    "cell_uvpr": _p("cell_uvpr", "Cell UVPR", "Voltage", 0x03, 1000, 4, 1.2, 4.35, "V", 0.001, critical=True),
+    "cell_ovp": _p("cell_ovp", "Cell OVP", "Voltage", 0x04, 1000, 4, 1.2, 4.35, "V", 0.001, critical=True),
+    "cell_ovpr": _p("cell_ovpr", "Cell OVPR", "Voltage", 0x05, 1000, 4, 1.2, 4.35, "V", 0.001, critical=True),
+    "balance_trigger_voltage": _p("balance_trigger_voltage", "Balance trigger voltage", "Balancing", 0x06, 1000, 4, 0.003, 1.0, "V", 0.001),
+    "soc_100_voltage": _p("soc_100_voltage", "SOC 100% voltage", "SOC", 0x07, 1000, 4, 0.003, 3.65, "V", 0.001),
+    "soc_0_voltage": _p("soc_0_voltage", "SOC 0% voltage", "SOC", 0x08, 1000, 4, 0.003, 3.65, "V", 0.001),
+    "cell_rcv": _p("cell_rcv", "Cell request charge voltage", "Charging", 0x09, 1000, 4, 0.003, 3.65, "V", 0.001),
+    "cell_rfv": _p("cell_rfv", "Cell request float voltage", "Charging", 0x0A, 1000, 4, 0.003, 3.65, "V", 0.001),
+    "power_off_voltage": _p("power_off_voltage", "Power-off voltage", "Voltage", 0x0B, 1000, 4, 1.2, 4.35, "V", 0.01, critical=True),
+
+    # Current, timing, balancing and pack
+    "max_charge_current": _p("max_charge_current", "Maximum charge current", "Current", 0x0C, 1000, 4, 1.0, 600.1, "A", 0.1, critical=True),
+    "charge_ocp_delay": _p("charge_ocp_delay", "Charge OCP delay", "Protection", 0x0D, 1, 4, 2, 600, "s", 1),
+    "charge_ocp_recovery": _p("charge_ocp_recovery", "Charge OCP recovery time", "Protection", 0x0E, 1, 4, 2, 600, "s", 1),
+    "max_discharge_current": _p("max_discharge_current", "Maximum discharge current", "Current", 0x0F, 1000, 4, 1.0, 1200.1, "A", 0.1, critical=True),
+    "discharge_ocp_delay": _p("discharge_ocp_delay", "Discharge OCP delay", "Protection", 0x10, 1, 4, 2, 600, "s", 1),
+    "discharge_ocp_recovery": _p("discharge_ocp_recovery", "Discharge OCP recovery time", "Protection", 0x11, 1, 4, 2, 600, "s", 1),
+    "scp_recovery": _p("scp_recovery", "Short-circuit recovery time", "Protection", 0x12, 1, 4, 2, 600, "s", 1),
+    "max_balance_current": _p("max_balance_current", "Maximum balance current", "Balancing", 0x13, 1000, 4, 0.3, 15.0, "A", 0.1),
+    "cell_count": _p("cell_count", "Cell count", "Pack", 0x1C, 1, 4, 2, 32, "", 1, critical=True, note="Changing cell count can disable or misconfigure protection."),
+    "nominal_capacity": _p("nominal_capacity", "Nominal battery capacity", "Pack", 0x20, 1000, 4, 2, 20000, "Ah", 1),
+    "scp_delay": _p("scp_delay", "Short-circuit protection delay", "Protection", 0x21, 1, 4, 0, 1000000, "µs", 1, critical=True),
+    "start_balance_voltage": _p("start_balance_voltage", "Start balance voltage", "Balancing", 0x22, 1000, 4, 1.2, 4.25, "V", 0.01),
+    "precharge_time": _p("precharge_time", "Precharge time", "Controls", 0x25, 1, 4, 0, 255, "s", 1),
+
+    # Temperature
+    "charge_otp": _p("charge_otp", "Charge OTP", "Temperature", 0x14, 10, 4, 30, 80, "°C", 0.1, critical=True),
+    "charge_otp_recovery": _p("charge_otp_recovery", "Charge OTP recovery", "Temperature", 0x15, 10, 4, 30, 80, "°C", 0.1),
+    "discharge_otp": _p("discharge_otp", "Discharge OTP", "Temperature", 0x16, 10, 4, 30, 80, "°C", 0.1, critical=True),
+    "discharge_otp_recovery": _p("discharge_otp_recovery", "Discharge OTP recovery", "Temperature", 0x17, 10, 4, 30, 80, "°C", 0.1),
+    "charge_utp": _p("charge_utp", "Charge UTP", "Temperature", 0x18, 10, 4, -45, 20, "°C", 0.1, critical=True),
+    "charge_utp_recovery": _p("charge_utp_recovery", "Charge UTP recovery", "Temperature", 0x19, 10, 4, -45, 20, "°C", 0.1),
+    "mos_otp": _p("mos_otp", "MOS OTP", "Temperature", 0x1A, 10, 4, 50, 110, "°C", 0.1, critical=True),
+    "mos_otp_recovery": _p("mos_otp_recovery", "MOS OTP recovery", "Temperature", 0x1B, 10, 4, 50, 110, "°C", 0.1),
+    "heating_start_temperature": _p("heating_start_temperature", "Heating start temperature", "Heating", 0x37, 1, 1, -40, 100, "°C", 1),
+    "heating_stop_temperature": _p("heating_stop_temperature", "Heating stop temperature", "Heating", 0x38, 1, 1, -40, 100, "°C", 1),
+    "smart_sleep_hours": _p("smart_sleep_hours", "Smart sleep delay", "Sleep", 0x39, 1, 1, 1, 100, "h", 1),
+    "discharge_utp": _p("discharge_utp", "Discharge UTP", "Temperature", 0x3A, 1, 1, -40, 100, "°C", 1, critical=True),
+    "discharge_utp_recovery": _p("discharge_utp_recovery", "Discharge UTP recovery", "Temperature", 0x3B, 1, 1, -40, 100, "°C", 1),
+
+    # Primary MOS and feature controls
+    "charge_switch": _p("charge_switch", "Charge MOS", "Controls", 0x1D, 1, 4, 0, 1, "", 1, kind="bool", critical=True),
+    "discharge_switch": _p("discharge_switch", "Discharge MOS", "Controls", 0x1E, 1, 4, 0, 1, "", 1, kind="bool", critical=True),
+    "balancer_switch": _p("balancer_switch", "Balancer", "Controls", 0x1F, 1, 4, 0, 1, "", 1, kind="bool"),
+    "heating_enabled": _p("heating_enabled", "Heating enabled", "Controls", 0x27, 1, 4, 0, 1, "", 1, kind="bool"),
+    "temperature_sensors_disabled": _p("temperature_sensors_disabled", "Disable temperature sensors", "Controls", 0x28, 1, 4, 0, 1, "", 1, kind="bool", critical=True),
+    "display_always_on": _p("display_always_on", "Display always on", "Controls", 0x2B, 1, 4, 0, 1, "", 1, kind="bool"),
+    "smart_sleep_enabled": _p("smart_sleep_enabled", "Smart sleep enabled", "Controls", 0x2D, 1, 4, 0, 1, "", 1, kind="bool"),
+    "pcl_module_disabled": _p("pcl_module_disabled", "Disable PCL module", "Controls", 0x2E, 1, 4, 0, 1, "", 1, kind="bool"),
+    "timed_stored_data": _p("timed_stored_data", "Timed stored data", "Controls", 0x2F, 1, 4, 0, 1, "", 1, kind="bool"),
+    "charging_float_mode": _p("charging_float_mode", "Charging float mode", "Controls", 0x30, 1, 4, 0, 1, "", 1, kind="bool"),
 }
+
+# Compatibility alias used by the v0.3 transaction and GUI code.
+SAFE_WRITABLE_PARAMETERS = WRITABLE_PARAMETERS
 
 
 GET_SETTINGS = make_command(0x96)
@@ -270,6 +321,7 @@ def parse_settings(frame: bytes) -> dict[str, Any]:
         name: bool(controls & (1 << bit))
         for bit, name in CONTROL_BITS.items()
     }
+    values.update(values["controls"])
 
     values["_frame_counter"] = frame[5]
     values["_crc_valid"] = frame_crc_valid(frame)
