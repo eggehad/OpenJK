@@ -1,6 +1,27 @@
-# OpenJK v0.4.0
+# OpenJK v0.4.1
 
 OpenJK is an open-source engineering workstation for JK Smart BMS systems over Bluetooth LE.
+
+## v0.4.1 cell-view refinement
+
+The 16 JK BMS cell channels are displayed as 16 parallel-pair blocks representing
+32 physical cells: `1|2, 3|4, ... 31|32`.  All blocks remain in one horizontal
+row, with a small mechanical midpoint gap between physical cells 16 and 17.
+
+The cell bodies are deliberately neutral.  A segmented color strip directly below
+them carries the quantitative color information and uses an approximately 25-second
+exponential fade so normal sub-millivolt sample jitter does not flash the display.
+The numerical voltage and deviation remain live.
+
+Cell-view keyboard modes:
+
+- **D** — deviation from pack average
+- **V** — absolute voltage
+- **R** — wire resistance
+- **H** — change in cell deviation over roughly 60 seconds
+
+Keyboard shortcuts are ignored while focus is in an editable control.
+
 
 ## Milestone: the battery becomes visible
 
@@ -8,25 +29,20 @@ v0.4.0 adds a live physical heat map and a time-lapse recorder.
 
 ### Physical pack view
 
-The cell display follows the supplied serpentine layout:
+A 16-channel JK BMS in this installation represents 16 parallel cell groups, or
+32 physical cells.  OpenJK renders each BMS channel as one split compound block:
 
 ```text
-Top:     17 18 19 ... 31 32
-Bottom:  16 15 14 ... 02 01
+1|2  3|4  5|6  ...  15|16     17|18  19|20  ...  31|32
 ```
 
-Both terminals and the current path are on the right side. If a connected BMS
-reports only 16 channels, OpenJK places them on the lower right-to-left row.
+The small center gap marks the physical 16/17 battery-half boundary while keeping
+the electrical/color progression visually continuous.  Each block shows one shared
+BMS voltage and deviation because the two physical cells in the block are parallel.
+The highest BMS group has a red outline and the lowest has a blue outline.
 
-Each tile shows:
-
-- cell number
-- cell voltage
-- deviation from the pack average
-
-The highest cell has a red outline. The lowest cell has a blue outline.
-
-Hovering a tile shows its voltage, deviation, wire resistance, and physical row.
+Hovering a block shows its BMS group, physical-cell pair, voltage, deviation, and
+wire resistance.
 
 ### Color modes
 

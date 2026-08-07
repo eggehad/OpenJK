@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import queue
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -12,7 +13,7 @@ from typing import Any
 from .engine import BMSState, BleWorker, DeviceRow
 from .protocol import SETTINGS, settings_rows
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 
 
 class OpenJKApp:
@@ -40,11 +41,20 @@ class OpenJKApp:
         self.history_playing = False
         self.history_after_id: str | None = None
         self.hover_cell_number: int | None = None
+        # Slow visual state for the deviation/color strip.  Numerical values stay live;
+        # only the color presentation is deliberately damped so sub-mV jitter does not flash.
+        self.cell_color_tau_seconds = 25.0
+        self.cell_smoothed_metrics: dict[int, float] = {}
+        self.cell_smoothing_mode = self.cell_color_mode.get()
+        self.cell_smoothing_last_time: float | None = None
+        # Short rolling voltage history used by the H (60 s drift) display mode.
+        self.cell_trend_history: list[tuple[float, dict[int, float]]] = []
 
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.raw_log = Path.cwd() / f"openjk_raw_{stamp}.log"
 
         self._build_ui()
+        self._bind_cell_mode_keys()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.after(75, self._drain_events)
 
@@ -156,7 +166,7 @@ class OpenJKApp:
         self.cell_mode_combo = ttk.Combobox(
             cell_toolbar,
             textvariable=self.cell_color_mode,
-            values=("Deviation", "Absolute voltage", "Wire resistance"),
+            values=("Deviation", "Absolute voltage", "Wire resistance", "Trend (60 s)"),
             state="readonly",
             width=18,
         )
@@ -183,6 +193,12 @@ class OpenJKApp:
             text="Capture history",
             variable=self.history_enabled,
         ).pack(side="left", padx=(18, 0))
+
+        ttk.Label(
+            cell_toolbar,
+            text="  Keys: D deviation   V voltage   R resistance   H 60 s drift",
+            foreground="#5d6772",
+        ).pack(side="left", padx=(14, 0))
 
         ttk.Button(
             cell_toolbar,
@@ -765,6 +781,7 @@ class OpenJKApp:
                 self._display_live(payload)
                 cells = payload.get("cells", [])
                 self.latest_cells = [dict(cell) for cell in cells]
+                self._record_cell_trend_sample(self.latest_cells)
                 if not self.history_samples:
                     self.display_cells = [dict(cell) for cell in cells]
                     self._draw_cell_map()
@@ -828,6 +845,73 @@ class OpenJKApp:
             unit = self.live_units.get(key, "")
             var.set(f"{shown} {unit}".strip())
 
+    def _bind_cell_mode_keys(self) -> None:
+        for key in ("d", "v", "r", "h"):
+            self.root.bind(f"<{key}>", self._cell_mode_key)
+            self.root.bind(f"<{key.upper()}>", self._cell_mode_key)
+
+    def _cell_mode_key(self, event: tk.Event) -> None:
+        # Do not steal letters while the user is typing into an editable control.
+        if isinstance(event.widget, (tk.Entry, ttk.Entry, ttk.Spinbox, ttk.Combobox)):
+            return
+        modes = {
+            "d": "Deviation",
+            "v": "Absolute voltage",
+            "r": "Wire resistance",
+            "h": "Trend (60 s)",
+        }
+        mode = modes.get(str(event.keysym).lower())
+        if mode:
+            self.cell_color_mode.set(mode)
+            self.cell_smoothed_metrics.clear()
+            self.cell_smoothing_last_time = None
+            self.cell_smoothing_mode = mode
+            self._draw_cell_map()
+
+    def _record_cell_trend_sample(self, cells: list[dict[str, Any]]) -> None:
+        now = time.monotonic()
+        snapshot = {int(c["number"]): float(c["voltage"]) for c in cells}
+        self.cell_trend_history.append((now, snapshot))
+        cutoff = now - 300.0
+        while self.cell_trend_history and self.cell_trend_history[0][0] < cutoff:
+            self.cell_trend_history.pop(0)
+
+    def _trend_metric(self, cell: dict[str, Any], average: float) -> float:
+        if not self.cell_trend_history:
+            return 0.0
+        target = time.monotonic() - 60.0
+        then_time, then_cells = min(
+            self.cell_trend_history, key=lambda sample: abs(sample[0] - target)
+        )
+        # Until there is useful history, leave the trend neutral instead of inventing motion.
+        if time.monotonic() - then_time < 20.0:
+            return 0.0
+        number = int(cell["number"])
+        if number not in then_cells:
+            return 0.0
+        then_average = sum(then_cells.values()) / len(then_cells)
+        now_delta = (float(cell["voltage"]) - average) * 1000.0
+        then_delta = (then_cells[number] - then_average) * 1000.0
+        return now_delta - then_delta
+
+    def _smoothed_metrics(self, raw: dict[int, float]) -> dict[int, float]:
+        mode = self.cell_color_mode.get()
+        now = time.monotonic()
+        if mode != self.cell_smoothing_mode or self.cell_smoothing_last_time is None:
+            self.cell_smoothed_metrics = dict(raw)
+            self.cell_smoothing_mode = mode
+            self.cell_smoothing_last_time = now
+            return dict(raw)
+        elapsed = max(0.0, now - self.cell_smoothing_last_time)
+        self.cell_smoothing_last_time = now
+        # Exponential fade with ~25 s time constant: fast enough to follow real pack movement,
+        # slow enough to suppress the one-frame red/blue confetti seen in v0.4.0.
+        alpha = 1.0 - pow(2.718281828459045, -elapsed / self.cell_color_tau_seconds)
+        for number, target in raw.items():
+            old = self.cell_smoothed_metrics.get(number, target)
+            self.cell_smoothed_metrics[number] = old + (target - old) * alpha
+        return dict(self.cell_smoothed_metrics)
+
     @staticmethod
     def _mix_color(left: str, right: str, fraction: float) -> str:
         fraction = max(0.0, min(1.0, fraction))
@@ -853,19 +937,8 @@ class OpenJKApp:
         return stops[-1][1]
 
     def _physical_positions(self, count: int) -> list[tuple[int, int, int]]:
-        """Return (cell number, row, column) for the user's serpentine pack."""
-        positions: list[tuple[int, int, int]] = []
-        if count >= 32:
-            positions.extend((number, 0, number - 17) for number in range(17, 33))
-            positions.extend((number, 1, 16 - number) for number in range(1, 17))
-            # Any cells beyond 32 continue in numerical rows underneath.
-            for number in range(33, count + 1):
-                index = number - 33
-                positions.append((number, 2 + index // 16, index % 16))
-        else:
-            # A 16-channel BMS still follows the physical right-to-left lower row.
-            positions.extend((number, 1, 16 - number) for number in range(1, count + 1))
-        return positions
+        """Return one continuous row of BMS channels; channel 9 starts after a midpoint gap."""
+        return [(number, 0, number - 1) for number in range(1, count + 1)]
 
     def _cell_metric(self, cell: dict[str, Any], average: float) -> float:
         mode = self.cell_color_mode.get()
@@ -873,6 +946,8 @@ class OpenJKApp:
             return float(cell.get("wire_resistance", 0.0))
         if mode == "Absolute voltage":
             return float(cell.get("voltage", 0.0))
+        if mode == "Trend (60 s)":
+            return self._trend_metric(cell, average)
         return (float(cell.get("voltage", 0.0)) - average) * 1000.0
 
     def _draw_cell_map(self) -> None:
@@ -886,142 +961,123 @@ class OpenJKApp:
 
         if not cells:
             canvas.create_text(
-                width / 2,
-                height / 2,
-                text="Waiting for live cell data…",
-                fill="#58606b",
+                width / 2, height / 2,
+                text="Waiting for live cell data…", fill="#58606b",
                 font=("Segoe UI", 14),
             )
             return
 
-        cells_by_number = {int(cell["number"]): cell for cell in cells}
-        count = max(cells_by_number)
-        positions = self._physical_positions(count)
+        cells = sorted(cells, key=lambda item: int(item["number"]))
         voltages = [float(cell["voltage"]) for cell in cells]
         average = sum(voltages) / len(voltages)
         low_voltage = min(voltages)
         high_voltage = max(voltages)
-        low_number = min(cells, key=lambda item: float(item["voltage"]))["number"]
-        high_number = max(cells, key=lambda item: float(item["voltage"]))["number"]
+        low_number = int(min(cells, key=lambda item: float(item["voltage"]))["number"])
+        high_number = int(max(cells, key=lambda item: float(item["voltage"]))["number"])
 
-        metrics = [self._cell_metric(cell, average) for cell in cells]
+        raw_metrics = {
+            int(cell["number"]): self._cell_metric(cell, average) for cell in cells
+        }
+        metrics = self._smoothed_metrics(raw_metrics)
         mode = self.cell_color_mode.get()
-        if mode == "Deviation":
+        metric_values = list(metrics.values())
+        if mode in ("Deviation", "Trend (60 s)"):
             band = max(float(self.cell_band_mv.get()), 0.5)
             metric_min, metric_max = -band, band
         else:
-            metric_min, metric_max = min(metrics), max(metrics)
+            metric_min, metric_max = min(metric_values), max(metric_values)
             if abs(metric_max - metric_min) < 1e-12:
                 metric_max = metric_min + 1.0
 
-        rows = max(row for _, row, _ in positions) + 1
-        margin_x = 42
-        top = 50
-        bottom = 62
-        gap = 5
-        available_w = width - 2 * margin_x
-        available_h = height - top - bottom
-        cell_w = max(34, (available_w - 15 * gap) / 16)
-        cell_h = max(56, min(92, (available_h - max(0, rows - 1) * 14) / rows))
+        margin_x = 34
+        top = 56
+        block_gap = 4
+        midpoint_gap = 22
+        count = len(cells)
+        # Sixteen JK channels represent sixteen parallel pairs, i.e. 32 physical cells.
+        # Keep all groups in one row so the eye can follow color continuously; only the
+        # mechanical 16/17 midpoint gets a small visual break.
+        total_gaps = max(0, count - 1) * block_gap + (midpoint_gap if count > 8 else 0)
+        available_w = width - 2 * margin_x - total_gaps
+        block_w = max(34.0, available_w / max(count, 1))
+        block_h = max(76.0, min(104.0, height * 0.34))
+        strip_y0 = top + block_h + 10
+        strip_h = 20
 
         canvas.create_text(
-            margin_x,
-            18,
-            text="Physical pack heat map",
-            anchor="w",
-            fill="#1f2933",
-            font=("Segoe UI", 12, "bold"),
+            margin_x, 20, text="Battery cell map", anchor="w",
+            fill="#1f2933", font=("Segoe UI", 12, "bold"),
         )
         canvas.create_text(
-            width - margin_x,
-            18,
-            text="Both terminals / current path → right side",
-            anchor="e",
-            fill="#66717e",
-            font=("Segoe UI", 9),
+            width - margin_x, 20,
+            text=f"{count} BMS groups / {count * 2} physical cells   •   {mode}",
+            anchor="e", fill="#66717e", font=("Segoe UI", 9),
         )
 
-        self.cell_hitboxes: list[tuple[float, float, float, float, int]] = []
-        for number, row, column in positions:
-            cell = cells_by_number.get(number)
-            if not cell:
-                continue
-            x0 = margin_x + column * (cell_w + gap)
-            y0 = top + row * (cell_h + 14)
-            x1 = x0 + cell_w
-            y1 = y0 + cell_h
-            metric = self._cell_metric(cell, average)
-            fraction = (metric - metric_min) / (metric_max - metric_min)
-            fill = self._heat_color(fraction)
+        self.cell_hitboxes = []
+        x = margin_x
+        for index, cell in enumerate(cells):
+            number = int(cell["number"])
+            if index == 8:
+                # Physical split between cells 16 and 17 without breaking the color flow.
+                canvas.create_line(
+                    x + midpoint_gap / 2, top - 8,
+                    x + midpoint_gap / 2, strip_y0 + strip_h + 7,
+                    fill="#a9b0b8", dash=(2, 4),
+                )
+                x += midpoint_gap
 
-            outline = "#45515e"
+            x0, x1 = x, x + block_w
+            y0, y1 = top, top + block_h
+
+            outline = "#59636e"
             outline_width = 1
             if number == high_number:
-                outline = "#d51f2b"
-                outline_width = 3
+                outline, outline_width = "#d51f2b", 3
             elif number == low_number:
-                outline = "#087fd0"
-                outline_width = 3
+                outline, outline_width = "#087fd0", 3
 
+            # Cell bodies stay calm.  Continuous quantitative color lives in the strip below.
             canvas.create_rectangle(
-                x0, y0, x1, y1,
-                fill=fill,
-                outline=outline,
-                width=outline_width,
-                tags=(f"cell_{number}", "cell"),
+                x0, y0, x1, y1, fill="#eef1f4", outline=outline, width=outline_width
+            )
+            pair_a = 2 * number - 1
+            pair_b = 2 * number
+            canvas.create_text(
+                (x0 + x1) / 2, y0 + 16, text=f"{pair_a} | {pair_b}",
+                fill="#111820", font=("Segoe UI", 8, "bold"),
+            )
+            canvas.create_line(
+                (x0 + x1) / 2, y0 + 5, (x0 + x1) / 2, y0 + 27,
+                fill="#aab1b8", width=1,
             )
             canvas.create_text(
-                (x0 + x1) / 2,
-                y0 + 18,
-                text=str(number),
-                fill="#111820",
-                font=("Segoe UI", 9, "bold"),
-            )
-            canvas.create_text(
-                (x0 + x1) / 2,
-                y0 + 42,
+                (x0 + x1) / 2, y0 + 47,
                 text=f"{float(cell['voltage']):.3f}",
-                fill="#111820",
-                font=("Consolas", 10, "bold"),
+                fill="#111820", font=("Consolas", 10, "bold"),
             )
             delta_mv = (float(cell["voltage"]) - average) * 1000.0
             canvas.create_text(
-                (x0 + x1) / 2,
-                y1 - 12,
-                text=f"{delta_mv:+.1f} mV",
-                fill="#25313d",
-                font=("Consolas", 8),
-            )
-            self.cell_hitboxes.append((x0, y0, x1, y1, number))
-
-        # Draw the serpentine current path between the two 16-cell rows.
-        if count >= 32:
-            y_top = top + cell_h / 2
-            y_bottom = top + cell_h + 14 + cell_h / 2
-            x_left = margin_x - 14
-            x_right = margin_x + 15 * (cell_w + gap) + cell_w + 14
-            canvas.create_line(
-                x_left, y_top, x_right, y_top,
-                fill="#6e7883", width=2, arrow="last",
-            )
-            canvas.create_line(
-                x_left, y_bottom, x_right, y_bottom,
-                fill="#6e7883", width=2, arrow="first",
-            )
-            canvas.create_line(
-                x_left, y_top, x_left, y_bottom,
-                fill="#6e7883", width=2,
-            )
-            canvas.create_text(
-                x_right, y_top - 16, text="OUT", anchor="e",
-                fill="#4d5965", font=("Segoe UI", 8, "bold"),
-            )
-            canvas.create_text(
-                x_right, y_bottom + 16, text="IN", anchor="e",
-                fill="#4d5965", font=("Segoe UI", 8, "bold"),
+                (x0 + x1) / 2, y1 - 13, text=f"{delta_mv:+.1f} mV",
+                fill="#25313d", font=("Consolas", 8),
             )
 
-        # Legend
+            metric = metrics[number]
+            fraction = (metric - metric_min) / (metric_max - metric_min)
+            canvas.create_rectangle(
+                x0, strip_y0, x1, strip_y0 + strip_h,
+                fill=self._heat_color(fraction), outline="",
+            )
+            self.cell_hitboxes.append((x0, y0, x1, strip_y0 + strip_h, number))
+            x = x1 + block_gap
+
+        canvas.create_text(
+            margin_x, strip_y0 + strip_h + 16,
+            text="slow color strip • ~25 s fade", anchor="w",
+            fill="#66717e", font=("Segoe UI", 8),
+        )
+
+        # Fixed legend for deviation/trend; auto-ranged legend for voltage/resistance.
         legend_y = height - 30
         legend_x0 = margin_x + 60
         legend_x1 = width - margin_x - 60
@@ -1031,25 +1087,21 @@ class OpenJKApp:
             xb = legend_x0 + (legend_x1 - legend_x0) * (index + 1) / segments
             canvas.create_rectangle(
                 xa, legend_y, xb + 1, legend_y + 10,
-                fill=self._heat_color(index / (segments - 1)),
-                outline="",
+                fill=self._heat_color(index / (segments - 1)), outline="",
             )
-        canvas.create_text(
-            legend_x0 - 8, legend_y + 5, text="Low",
-            anchor="e", fill="#4d5965", font=("Segoe UI", 8),
-        )
-        canvas.create_text(
-            legend_x1 + 8, legend_y + 5, text="High",
-            anchor="w", fill="#4d5965", font=("Segoe UI", 8),
-        )
+        canvas.create_text(legend_x0 - 8, legend_y + 5, text="Low", anchor="e",
+                           fill="#4d5965", font=("Segoe UI", 8))
+        canvas.create_text(legend_x1 + 8, legend_y + 5, text="High", anchor="w",
+                           fill="#4d5965", font=("Segoe UI", 8))
 
         delta = (high_voltage - low_voltage) * 1000.0
         self.cell_stats_var.set(
             f"Average:     {average:.3f} V\n"
-            f"Highest:    Cell {high_number}  {high_voltage:.3f} V\n"
-            f"Lowest:     Cell {low_number}  {low_voltage:.3f} V\n"
+            f"Highest:    Group {high_number}  {high_voltage:.3f} V\n"
+            f"Lowest:     Group {low_number}  {low_voltage:.3f} V\n"
             f"Delta:       {delta:.1f} mV\n"
-            f"Cell count:  {len(cells)}\n"
+            f"BMS groups:  {len(cells)}\n"
+            f"Physical:    {len(cells) * 2} cells\n"
             f"Mode:        {mode}"
         )
 
@@ -1069,13 +1121,14 @@ class OpenJKApp:
                 voltages = [float(item["voltage"]) for item in cells]
                 average = sum(voltages) / len(voltages)
                 delta_mv = (float(cell["voltage"]) - average) * 1000.0
+                pair_a, pair_b = 2 * number - 1, 2 * number
+                half = "second half" if number > 8 else "first half"
                 self.cell_detail_var.set(
-                    f"Cell {number}\n\n"
+                    f"BMS group {number}  •  physical cells {pair_a}/{pair_b}\n\n"
                     f"Voltage:          {float(cell['voltage']):.3f} V\n"
                     f"From average:     {delta_mv:+.1f} mV\n"
                     f"Wire resistance:  {float(cell.get('wire_resistance', 0.0)):.3f} Ω\n\n"
-                    f"Physical position: row "
-                    f"{'top' if number >= 17 else 'bottom'}"
+                    f"Pack position:    {half}"
                 )
                 return
         self._cell_leave()
