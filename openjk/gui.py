@@ -12,7 +12,7 @@ from typing import Any
 from .engine import BMSState, BleWorker, DeviceRow
 from .protocol import SETTINGS, settings_rows
 
-APP_VERSION = "0.3.3"
+APP_VERSION = "0.4.0"
 
 
 class OpenJKApp:
@@ -29,6 +29,17 @@ class OpenJKApp:
         self.pending_write: dict[str, Any] | None = None
         self.restore_value: dict[str, Any] | None = None
         self.max_write_attempts = 3
+
+        # Cell laboratory state
+        self.latest_cells: list[dict[str, Any]] = []
+        self.display_cells: list[dict[str, Any]] = []
+        self.cell_color_mode = tk.StringVar(value="Deviation")
+        self.cell_band_mv = tk.DoubleVar(value=3.0)
+        self.history_enabled = tk.BooleanVar(value=True)
+        self.history_samples: list[dict[str, Any]] = []
+        self.history_playing = False
+        self.history_after_id: str | None = None
+        self.hover_cell_number: int | None = None
 
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.raw_log = Path.cwd() / f"openjk_raw_{stamp}.log"
@@ -137,26 +148,123 @@ class OpenJKApp:
             self.settings_tree.column(col, width=width, anchor=anchor)
         self.settings_tree.pack(fill="both", expand=True)
 
-        self.cells_tree = ttk.Treeview(
-            cells_tab,
-            columns=("cell", "voltage", "wire_resistance"),
-            show="headings",
+        # Physical cell laboratory
+        cell_toolbar = ttk.Frame(cells_tab)
+        cell_toolbar.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(cell_toolbar, text="Color mode:").pack(side="left")
+        self.cell_mode_combo = ttk.Combobox(
+            cell_toolbar,
+            textvariable=self.cell_color_mode,
+            values=("Deviation", "Absolute voltage", "Wire resistance"),
+            state="readonly",
+            width=18,
         )
-        for col, title, width in (
-            ("cell", "Cell", 80),
-            ("voltage", "Voltage", 140),
-            ("wire_resistance", "Measured resistance", 160),
-        ):
-            self.cells_tree.heading(col, text=title)
-            self.cells_tree.column(col, width=width, anchor="e")
-        self.cells_tree.pack(fill="both", expand=True)
+        self.cell_mode_combo.pack(side="left", padx=(6, 14))
+        self.cell_mode_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._draw_cell_map()
+        )
+
+        ttk.Label(cell_toolbar, text="Band:").pack(side="left")
+        self.cell_band_spin = ttk.Spinbox(
+            cell_toolbar,
+            from_=1.0,
+            to=20.0,
+            increment=1.0,
+            textvariable=self.cell_band_mv,
+            width=5,
+            command=self._draw_cell_map,
+        )
+        self.cell_band_spin.pack(side="left", padx=(6, 2))
+        ttk.Label(cell_toolbar, text="mV").pack(side="left")
+
+        ttk.Checkbutton(
+            cell_toolbar,
+            text="Capture history",
+            variable=self.history_enabled,
+        ).pack(side="left", padx=(18, 0))
+
+        ttk.Button(
+            cell_toolbar,
+            text="Load history…",
+            command=self._load_history,
+        ).pack(side="right")
+        ttk.Button(
+            cell_toolbar,
+            text="Live",
+            command=self._show_live_cells,
+        ).pack(side="right", padx=(0, 8))
+
+        map_frame = ttk.Frame(cells_tab)
+        map_frame.pack(fill="both", expand=True)
+
+        self.cell_canvas = tk.Canvas(
+            map_frame,
+            background="#f7f8fa",
+            highlightthickness=1,
+            highlightbackground="#c8cdd3",
+        )
+        self.cell_canvas.pack(side="left", fill="both", expand=True)
+        self.cell_canvas.bind("<Configure>", lambda _event: self._draw_cell_map())
+        self.cell_canvas.bind("<Motion>", self._cell_hover)
+        self.cell_canvas.bind("<Leave>", self._cell_leave)
+
+        details = ttk.Frame(map_frame, padding=(12, 4))
+        details.pack(side="right", fill="y")
+        ttk.Label(details, text="Cell details", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        self.cell_detail_var = tk.StringVar(
+            value="Move the pointer over a cell."
+        )
+        ttk.Label(
+            details,
+            textvariable=self.cell_detail_var,
+            justify="left",
+            width=29,
+            wraplength=230,
+        ).pack(anchor="w", pady=(8, 18))
+
+        ttk.Separator(details, orient="horizontal").pack(fill="x", pady=4)
+        ttk.Label(details, text="Pack statistics", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(8, 4))
+        self.cell_stats_var = tk.StringVar(value="Waiting for live cell data.")
+        ttk.Label(
+            details,
+            textvariable=self.cell_stats_var,
+            justify="left",
+            width=29,
+        ).pack(anchor="w")
+
+        history_frame = ttk.LabelFrame(cells_tab, text="Time-lapse", padding=8)
+        history_frame.pack(fill="x", pady=(8, 0))
+        self.history_status_var = tk.StringVar(value="Live view")
+        ttk.Label(
+            history_frame,
+            textvariable=self.history_status_var,
+        ).pack(side="left")
+
+        self.history_scale = ttk.Scale(
+            history_frame,
+            from_=0,
+            to=1,
+            orient="horizontal",
+            command=self._history_scrub,
+        )
+        self.history_scale.pack(side="left", fill="x", expand=True, padx=12)
+        self.history_scale.configure(state="disabled")
+
+        self.history_play_button = ttk.Button(
+            history_frame,
+            text="▶ Play",
+            command=self._toggle_history_play,
+            state="disabled",
+        )
+        self.history_play_button.pack(side="right")
 
         from .protocol import SAFE_WRITABLE_PARAMETERS
 
         ttk.Label(
             writes_tab,
             text=(
-                "First write milestone: four reversible JK02_32S voltage settings. "
+                "All decoded JK02_32S settings use the same guarded write engine. "
                 "Every write saves a backup and is verified from a fresh settings frame."
             ),
             wraplength=760,
@@ -277,8 +385,8 @@ class OpenJKApp:
         ttk.Label(
             outer,
             text=(
-                "v0.3.3 exposes every decoded JK02_32S numeric and control "
-                "setting with the same backup, retry, verification, and restore engine."
+                "v0.4.0 adds the physical serpentine heat map and one-second "
+                "cell-history capture with interactive time-lapse playback."
             ),
         ).pack(anchor="w", pady=(8, 0))
 
@@ -655,10 +763,16 @@ class OpenJKApp:
             elif kind == "live":
                 self.state.live = payload
                 self._display_live(payload)
-                self._display_cells(payload.get("cells", []))
+                cells = payload.get("cells", [])
+                self.latest_cells = [dict(cell) for cell in cells]
+                if not self.history_samples:
+                    self.display_cells = [dict(cell) for cell in cells]
+                    self._draw_cell_map()
+                if self.history_enabled.get():
+                    self._capture_history_sample(payload)
                 self.status_var.set(
                     f"Live: {payload.get('pack_voltage', 0):.3f} V, "
-                    f"{payload.get('pack_current', 0):+.3f} A"
+                    f"{payload.get('pack_current', 0):+.1f} A"
                 )
         self.root.after(75, self._drain_events)
 
@@ -714,18 +828,398 @@ class OpenJKApp:
             unit = self.live_units.get(key, "")
             var.set(f"{shown} {unit}".strip())
 
-    def _display_cells(self, cells: list[dict[str, Any]]) -> None:
-        self.cells_tree.delete(*self.cells_tree.get_children())
-        for cell in cells:
-            self.cells_tree.insert(
-                "",
-                "end",
-                values=(
-                    cell["number"],
-                    f"{cell['voltage']:.3f} V",
-                    f"{cell['wire_resistance']:.3f} Ω",
-                ),
+    @staticmethod
+    def _mix_color(left: str, right: str, fraction: float) -> str:
+        fraction = max(0.0, min(1.0, fraction))
+        a = tuple(int(left[index:index + 2], 16) for index in (1, 3, 5))
+        b = tuple(int(right[index:index + 2], 16) for index in (1, 3, 5))
+        rgb = tuple(round(x + (y - x) * fraction) for x, y in zip(a, b))
+        return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+    @classmethod
+    def _heat_color(cls, fraction: float) -> str:
+        stops = (
+            (0.00, "#2775d8"),
+            (0.25, "#36bfc6"),
+            (0.50, "#8dce62"),
+            (0.70, "#e5d33f"),
+            (0.85, "#f29335"),
+            (1.00, "#eb4545"),
+        )
+        fraction = max(0.0, min(1.0, fraction))
+        for (x0, c0), (x1, c1) in zip(stops, stops[1:]):
+            if x0 <= fraction <= x1:
+                return cls._mix_color(c0, c1, (fraction - x0) / (x1 - x0))
+        return stops[-1][1]
+
+    def _physical_positions(self, count: int) -> list[tuple[int, int, int]]:
+        """Return (cell number, row, column) for the user's serpentine pack."""
+        positions: list[tuple[int, int, int]] = []
+        if count >= 32:
+            positions.extend((number, 0, number - 17) for number in range(17, 33))
+            positions.extend((number, 1, 16 - number) for number in range(1, 17))
+            # Any cells beyond 32 continue in numerical rows underneath.
+            for number in range(33, count + 1):
+                index = number - 33
+                positions.append((number, 2 + index // 16, index % 16))
+        else:
+            # A 16-channel BMS still follows the physical right-to-left lower row.
+            positions.extend((number, 1, 16 - number) for number in range(1, count + 1))
+        return positions
+
+    def _cell_metric(self, cell: dict[str, Any], average: float) -> float:
+        mode = self.cell_color_mode.get()
+        if mode == "Wire resistance":
+            return float(cell.get("wire_resistance", 0.0))
+        if mode == "Absolute voltage":
+            return float(cell.get("voltage", 0.0))
+        return (float(cell.get("voltage", 0.0)) - average) * 1000.0
+
+    def _draw_cell_map(self) -> None:
+        if not hasattr(self, "cell_canvas"):
+            return
+        canvas = self.cell_canvas
+        canvas.delete("all")
+        cells = self.display_cells or self.latest_cells
+        width = max(canvas.winfo_width(), 700)
+        height = max(canvas.winfo_height(), 340)
+
+        if not cells:
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text="Waiting for live cell data…",
+                fill="#58606b",
+                font=("Segoe UI", 14),
             )
+            return
+
+        cells_by_number = {int(cell["number"]): cell for cell in cells}
+        count = max(cells_by_number)
+        positions = self._physical_positions(count)
+        voltages = [float(cell["voltage"]) for cell in cells]
+        average = sum(voltages) / len(voltages)
+        low_voltage = min(voltages)
+        high_voltage = max(voltages)
+        low_number = min(cells, key=lambda item: float(item["voltage"]))["number"]
+        high_number = max(cells, key=lambda item: float(item["voltage"]))["number"]
+
+        metrics = [self._cell_metric(cell, average) for cell in cells]
+        mode = self.cell_color_mode.get()
+        if mode == "Deviation":
+            band = max(float(self.cell_band_mv.get()), 0.5)
+            metric_min, metric_max = -band, band
+        else:
+            metric_min, metric_max = min(metrics), max(metrics)
+            if abs(metric_max - metric_min) < 1e-12:
+                metric_max = metric_min + 1.0
+
+        rows = max(row for _, row, _ in positions) + 1
+        margin_x = 42
+        top = 50
+        bottom = 62
+        gap = 5
+        available_w = width - 2 * margin_x
+        available_h = height - top - bottom
+        cell_w = max(34, (available_w - 15 * gap) / 16)
+        cell_h = max(56, min(92, (available_h - max(0, rows - 1) * 14) / rows))
+
+        canvas.create_text(
+            margin_x,
+            18,
+            text="Physical pack heat map",
+            anchor="w",
+            fill="#1f2933",
+            font=("Segoe UI", 12, "bold"),
+        )
+        canvas.create_text(
+            width - margin_x,
+            18,
+            text="Both terminals / current path → right side",
+            anchor="e",
+            fill="#66717e",
+            font=("Segoe UI", 9),
+        )
+
+        self.cell_hitboxes: list[tuple[float, float, float, float, int]] = []
+        for number, row, column in positions:
+            cell = cells_by_number.get(number)
+            if not cell:
+                continue
+            x0 = margin_x + column * (cell_w + gap)
+            y0 = top + row * (cell_h + 14)
+            x1 = x0 + cell_w
+            y1 = y0 + cell_h
+            metric = self._cell_metric(cell, average)
+            fraction = (metric - metric_min) / (metric_max - metric_min)
+            fill = self._heat_color(fraction)
+
+            outline = "#45515e"
+            outline_width = 1
+            if number == high_number:
+                outline = "#d51f2b"
+                outline_width = 3
+            elif number == low_number:
+                outline = "#087fd0"
+                outline_width = 3
+
+            canvas.create_rectangle(
+                x0, y0, x1, y1,
+                fill=fill,
+                outline=outline,
+                width=outline_width,
+                tags=(f"cell_{number}", "cell"),
+            )
+            canvas.create_text(
+                (x0 + x1) / 2,
+                y0 + 18,
+                text=str(number),
+                fill="#111820",
+                font=("Segoe UI", 9, "bold"),
+            )
+            canvas.create_text(
+                (x0 + x1) / 2,
+                y0 + 42,
+                text=f"{float(cell['voltage']):.3f}",
+                fill="#111820",
+                font=("Consolas", 10, "bold"),
+            )
+            delta_mv = (float(cell["voltage"]) - average) * 1000.0
+            canvas.create_text(
+                (x0 + x1) / 2,
+                y1 - 12,
+                text=f"{delta_mv:+.1f} mV",
+                fill="#25313d",
+                font=("Consolas", 8),
+            )
+            self.cell_hitboxes.append((x0, y0, x1, y1, number))
+
+        # Draw the serpentine current path between the two 16-cell rows.
+        if count >= 32:
+            y_top = top + cell_h / 2
+            y_bottom = top + cell_h + 14 + cell_h / 2
+            x_left = margin_x - 14
+            x_right = margin_x + 15 * (cell_w + gap) + cell_w + 14
+            canvas.create_line(
+                x_left, y_top, x_right, y_top,
+                fill="#6e7883", width=2, arrow="last",
+            )
+            canvas.create_line(
+                x_left, y_bottom, x_right, y_bottom,
+                fill="#6e7883", width=2, arrow="first",
+            )
+            canvas.create_line(
+                x_left, y_top, x_left, y_bottom,
+                fill="#6e7883", width=2,
+            )
+            canvas.create_text(
+                x_right, y_top - 16, text="OUT", anchor="e",
+                fill="#4d5965", font=("Segoe UI", 8, "bold"),
+            )
+            canvas.create_text(
+                x_right, y_bottom + 16, text="IN", anchor="e",
+                fill="#4d5965", font=("Segoe UI", 8, "bold"),
+            )
+
+        # Legend
+        legend_y = height - 30
+        legend_x0 = margin_x + 60
+        legend_x1 = width - margin_x - 60
+        segments = 80
+        for index in range(segments):
+            xa = legend_x0 + (legend_x1 - legend_x0) * index / segments
+            xb = legend_x0 + (legend_x1 - legend_x0) * (index + 1) / segments
+            canvas.create_rectangle(
+                xa, legend_y, xb + 1, legend_y + 10,
+                fill=self._heat_color(index / (segments - 1)),
+                outline="",
+            )
+        canvas.create_text(
+            legend_x0 - 8, legend_y + 5, text="Low",
+            anchor="e", fill="#4d5965", font=("Segoe UI", 8),
+        )
+        canvas.create_text(
+            legend_x1 + 8, legend_y + 5, text="High",
+            anchor="w", fill="#4d5965", font=("Segoe UI", 8),
+        )
+
+        delta = (high_voltage - low_voltage) * 1000.0
+        self.cell_stats_var.set(
+            f"Average:     {average:.3f} V\n"
+            f"Highest:    Cell {high_number}  {high_voltage:.3f} V\n"
+            f"Lowest:     Cell {low_number}  {low_voltage:.3f} V\n"
+            f"Delta:       {delta:.1f} mV\n"
+            f"Cell count:  {len(cells)}\n"
+            f"Mode:        {mode}"
+        )
+
+    def _cell_hover(self, event: tk.Event) -> None:
+        for x0, y0, x1, y1, number in getattr(self, "cell_hitboxes", []):
+            if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+                if number == self.hover_cell_number:
+                    return
+                self.hover_cell_number = number
+                cells = self.display_cells or self.latest_cells
+                cell = next(
+                    (item for item in cells if int(item["number"]) == number),
+                    None,
+                )
+                if not cell:
+                    return
+                voltages = [float(item["voltage"]) for item in cells]
+                average = sum(voltages) / len(voltages)
+                delta_mv = (float(cell["voltage"]) - average) * 1000.0
+                self.cell_detail_var.set(
+                    f"Cell {number}\n\n"
+                    f"Voltage:          {float(cell['voltage']):.3f} V\n"
+                    f"From average:     {delta_mv:+.1f} mV\n"
+                    f"Wire resistance:  {float(cell.get('wire_resistance', 0.0)):.3f} Ω\n\n"
+                    f"Physical position: row "
+                    f"{'top' if number >= 17 else 'bottom'}"
+                )
+                return
+        self._cell_leave()
+
+    def _cell_leave(self, _event: tk.Event | None = None) -> None:
+        self.hover_cell_number = None
+        self.cell_detail_var.set("Move the pointer over a cell.")
+
+    def _history_path(self) -> Path:
+        history_dir = Path.cwd() / "history"
+        history_dir.mkdir(exist_ok=True)
+        serial = (
+            self.state.device_info.get("serial_number")
+            or self.state.selected_device_name
+            or "jkbms"
+        )
+        safe_serial = "".join(
+            char if char.isalnum() or char in "-_" else "_"
+            for char in str(serial)
+        )
+        day = dt.datetime.now().strftime("%Y%m%d")
+        return history_dir / f"{safe_serial}_{day}.jsonl"
+
+    def _capture_history_sample(self, payload: dict[str, Any]) -> None:
+        cells = payload.get("cells", [])
+        if not cells:
+            return
+        sample = {
+            "timestamp": dt.datetime.now().isoformat(timespec="milliseconds"),
+            "pack_voltage": payload.get("pack_voltage"),
+            "pack_current": payload.get("pack_current"),
+            "soc": payload.get("soc"),
+            "cell_average": payload.get("cell_average"),
+            "cell_delta": payload.get("cell_delta"),
+            "balance_current": payload.get("balance_current"),
+            "temperatures": [
+                payload.get("mos_temperature"),
+                payload.get("temperature_1"),
+                payload.get("temperature_2"),
+            ],
+            "cells": [
+                {
+                    "number": int(cell["number"]),
+                    "voltage": float(cell["voltage"]),
+                    "wire_resistance": float(cell.get("wire_resistance", 0.0)),
+                }
+                for cell in cells
+            ],
+        }
+        with self._history_path().open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(sample, separators=(",", ":")) + "\n")
+
+    def _load_history(self) -> None:
+        filename = filedialog.askopenfilename(
+            title="Load OpenJK cell history",
+            initialdir=str(Path.cwd() / "history"),
+            filetypes=[
+                ("OpenJK history", "*.jsonl"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not filename:
+            return
+        samples: list[dict[str, Any]] = []
+        try:
+            with Path(filename).open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        samples.append(json.loads(line))
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror("OpenJK history", str(exc))
+            return
+        if not samples:
+            messagebox.showinfo("OpenJK history", "The selected file contains no samples.")
+            return
+
+        self.history_samples = samples
+        self.history_scale.configure(
+            from_=0,
+            to=max(1, len(samples) - 1),
+            state="normal",
+        )
+        self.history_scale.set(0)
+        self.history_play_button.configure(state="normal")
+        self._show_history_index(0)
+
+    def _history_scrub(self, value: str) -> None:
+        if not self.history_samples:
+            return
+        self._show_history_index(round(float(value)))
+
+    def _show_history_index(self, index: int) -> None:
+        if not self.history_samples:
+            return
+        index = max(0, min(len(self.history_samples) - 1, index))
+        sample = self.history_samples[index]
+        self.display_cells = [dict(cell) for cell in sample.get("cells", [])]
+        self._draw_cell_map()
+        timestamp = sample.get("timestamp", "")
+        current = sample.get("pack_current")
+        current_text = "—" if current is None else f"{float(current):+.1f} A"
+        self.history_status_var.set(
+            f"{index + 1:,}/{len(self.history_samples):,}  "
+            f"{timestamp}  Current {current_text}"
+        )
+
+    def _show_live_cells(self) -> None:
+        self._stop_history_play()
+        self.history_samples = []
+        self.display_cells = [dict(cell) for cell in self.latest_cells]
+        self.history_scale.configure(state="disabled")
+        self.history_play_button.configure(state="disabled")
+        self.history_status_var.set("Live view")
+        self._draw_cell_map()
+
+    def _toggle_history_play(self) -> None:
+        if not self.history_samples:
+            return
+        if self.history_playing:
+            self._stop_history_play()
+        else:
+            self.history_playing = True
+            self.history_play_button.configure(text="Ⅱ Pause")
+            self._advance_history()
+
+    def _advance_history(self) -> None:
+        if not self.history_playing or not self.history_samples:
+            return
+        current = round(float(self.history_scale.get()))
+        next_index = current + 1
+        if next_index >= len(self.history_samples):
+            next_index = 0
+        self.history_scale.set(next_index)
+        self._show_history_index(next_index)
+        self.history_after_id = self.root.after(90, self._advance_history)
+
+    def _stop_history_play(self) -> None:
+        self.history_playing = False
+        if hasattr(self, "history_play_button"):
+            self.history_play_button.configure(text="▶ Play")
+        if self.history_after_id is not None:
+            self.root.after_cancel(self.history_after_id)
+            self.history_after_id = None
 
     def _log(self, direction: str, payload: bytes) -> None:
         timestamp = dt.datetime.now().isoformat(timespec="milliseconds")
@@ -737,6 +1231,7 @@ class OpenJKApp:
             self.raw_text.see("end")
 
     def _close(self) -> None:
+        self._stop_history_play()
         self.worker.send("stop")
         self.root.after(150, self.root.destroy)
 

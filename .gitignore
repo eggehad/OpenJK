@@ -11,3 +11,5 @@ openjk_raw_*.log
 backups/
 
 transactions/
+
+history/
