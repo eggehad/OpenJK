@@ -5,6 +5,7 @@ import datetime as dt
 from decimal import Decimal
 import json
 import queue
+import socket
 import time
 import tkinter as tk
 from pathlib import Path
@@ -14,15 +15,16 @@ from typing import Any
 from .engine import BMSState, BleWorker, DeviceRow
 from .protocol import SAFE_WRITABLE_PARAMETERS, SETTINGS, settings_rows
 
-APP_VERSION = "0.4.6"
+APP_VERSION = "0.4.7"
 
 
 class OpenJKApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(f"OpenJK v{APP_VERSION} — JK BMS BLE Monitor")
-        self.root.geometry("1260x820")
-        self.root.minsize(980, 650)
+        self.root.geometry("1320x860")
+        self.root.minsize(1040, 700)
+        self.root.option_add("*tearOff", False)
 
         self.events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         self.worker = BleWorker(self.events)
@@ -64,98 +66,177 @@ class OpenJKApp:
         self.gui_drain_cycles = 0
         self.gui_events_processed = 0
 
+        self._configure_styles()
         self._build_ui()
         self._bind_cell_mode_keys()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.after(75, self._drain_events)
 
+    def _configure_styles(self) -> None:
+        """Give OpenJK a calmer visual hierarchy without changing platform-native widgets."""
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure("App.TFrame", background="#f3f5f7")
+        style.configure("Header.TFrame", background="#20262d")
+        style.configure(
+            "HeaderTitle.TLabel",
+            background="#20262d",
+            foreground="#ffffff",
+            font=("TkDefaultFont", 18, "bold"),
+        )
+        style.configure(
+            "HeaderSub.TLabel",
+            background="#20262d",
+            foreground="#c9d1d9",
+            font=("TkDefaultFont", 10),
+        )
+        style.configure(
+            "Section.TLabelframe.Label",
+            font=("TkDefaultFont", 10, "bold"),
+        )
+        style.configure("MetricName.TLabel", foreground="#5d6772")
+        style.configure("MetricValue.TLabel", font=("TkFixedFont", 11, "bold"))
+        style.configure(
+            "Status.TLabel",
+            relief="solid",
+            borderwidth=1,
+            padding=(8, 5),
+            background="#ffffff",
+        )
+        style.configure("Primary.TButton", padding=(11, 6))
+        style.configure("TNotebook.Tab", padding=(12, 7))
+        style.configure("Treeview", rowheight=24)
+        style.configure("Treeview.Heading", font=("TkDefaultFont", 9, "bold"))
+
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=10)
+        outer = ttk.Frame(self.root, padding=12, style="App.TFrame")
         outer.pack(fill="both", expand=True)
+
+        header = ttk.Frame(outer, padding=(16, 12), style="Header.TFrame")
+        header.pack(fill="x", pady=(0, 10))
+        ttk.Label(
+            header, text="OpenJK", style="HeaderTitle.TLabel"
+        ).pack(side="left")
+        ttk.Label(
+            header,
+            text="  JK BMS monitor, visualizer & configuration workstation  •  See the battery breathing",
+            style="HeaderSub.TLabel",
+        ).pack(side="left", padx=(6, 0), pady=(5, 0))
+        ttk.Label(
+            header, text=f"v{APP_VERSION}", style="HeaderSub.TLabel"
+        ).pack(side="right", pady=(5, 0))
 
         toolbar = ttk.Frame(outer)
         toolbar.pack(fill="x")
-        ttk.Button(toolbar, text="Scan", command=lambda: self.worker.send("scan")).pack(side="left")
+        ttk.Button(
+            toolbar, text="Scan for BMS", command=lambda: self.worker.send("scan"), style="Primary.TButton"
+        ).pack(side="left")
         ttk.Button(toolbar, text="Connect", command=self._connect_selected).pack(side="left", padx=(8, 0))
-        ttk.Button(toolbar, text="Disconnect", command=lambda: self.worker.send("disconnect")).pack(side="left", padx=(8, 0))
-        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Button(toolbar, text="Disconnect", command=lambda: self.worker.send("disconnect")).pack(side="left", padx=(6, 0))
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=12)
         ttk.Button(toolbar, text="Read settings", command=lambda: self.worker.send("read_settings")).pack(side="left")
-        ttk.Button(toolbar, text="Read identity", command=lambda: self.worker.send("read_device")).pack(side="left", padx=(8, 0))
+        ttk.Button(toolbar, text="Read identity", command=lambda: self.worker.send("read_device")).pack(side="left", padx=(6, 0))
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=12)
         self.backup_button = ttk.Button(toolbar, text="Save backup…", command=self._save_backup, state="disabled")
-        self.backup_button.pack(side="left", padx=(8, 0))
+        self.backup_button.pack(side="left")
         self.restore_backup_button = ttk.Button(
             toolbar, text="Restore backup…", command=self._restore_backup, state="disabled"
         )
-        self.restore_backup_button.pack(side="left", padx=(8, 0))
-        ttk.Label(toolbar, text=f"Raw log: {self.raw_log.name}").pack(side="right")
+        self.restore_backup_button.pack(side="left", padx=(6, 0))
+        ttk.Label(toolbar, text=f"Raw log: {self.raw_log.name}", foreground="#6b7280").pack(side="right")
 
-        self.status_var = tk.StringVar(value="Ready. Click Scan.")
-        ttk.Label(outer, textvariable=self.status_var, relief="sunken", anchor="w").pack(fill="x", pady=(8, 8))
+        self.status_var = tk.StringVar(value="Ready. Scan for a nearby JK BMS.")
+        ttk.Label(outer, textvariable=self.status_var, anchor="w", style="Status.TLabel").pack(fill="x", pady=(9, 9))
 
         paned = ttk.Panedwindow(outer, orient="horizontal")
         paned.pack(fill="both", expand=True)
-        left = ttk.Frame(paned, padding=4)
-        right = ttk.Frame(paned, padding=4)
+        left = ttk.LabelFrame(paned, text="Bluetooth devices", padding=8, style="Section.TLabelframe")
+        right = ttk.Frame(paned, padding=(8, 0, 0, 0))
         paned.add(left, weight=1)
         paned.add(right, weight=4)
 
-        ttk.Label(left, text="Nearby BLE devices").pack(anchor="w")
         self.device_tree = ttk.Treeview(left, columns=("name", "address", "rssi"), show="headings", height=20)
         for col, title, width in (
-            ("name", "Name", 190),
-            ("address", "Address / Windows ID", 250),
+            ("name", "Name", 180),
+            ("address", "Address / Windows ID", 235),
             ("rssi", "RSSI", 55),
         ):
             self.device_tree.heading(col, text=title)
             self.device_tree.column(col, width=width, anchor="w")
-        self.device_tree.pack(fill="both", expand=True, pady=(4, 0))
+        self.device_tree.pack(fill="both", expand=True)
         self.device_tree.bind("<Double-1>", lambda _event: self._connect_selected())
+        ttk.Label(
+            left, text="Tip: double-click a discovered BMS to connect.", foreground="#6b7280"
+        ).pack(anchor="w", pady=(6, 0))
 
         notebook = ttk.Notebook(right)
         notebook.pack(fill="both", expand=True)
 
-        dashboard = ttk.Frame(notebook, padding=10)
-        settings_tab = ttk.Frame(notebook, padding=10)
+        dashboard = ttk.Frame(notebook, padding=12)
         cells_tab = ttk.Frame(notebook, padding=10)
-        raw_tab = ttk.Frame(notebook, padding=10)
-        identity_tab = ttk.Frame(notebook, padding=10)
+        settings_tab = ttk.Frame(notebook, padding=10)
         writes_tab = ttk.Frame(notebook, padding=10)
-        notebook.add(dashboard, text="Dashboard")
+        identity_tab = ttk.Frame(notebook, padding=10)
+        raw_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(dashboard, text="Overview")
+        notebook.add(cells_tab, text="Cells • Live")
         notebook.add(settings_tab, text="Settings")
-        notebook.add(cells_tab, text="Cells")
         notebook.add(writes_tab, text="Safe writes")
         notebook.add(identity_tab, text="Identity")
         notebook.add(raw_tab, text="Raw frames")
 
         self.live_values: dict[str, tk.StringVar] = {}
         live_fields = [
-            ("pack_voltage", "Pack voltage", "V"),
-            ("pack_current", "Pack current", "A"),
-            ("pack_power", "Pack power", "W"),
-            ("soc", "SOC", "%"),
-            ("remaining_capacity", "Remaining capacity", "Ah"),
-            ("nominal_capacity", "Nominal capacity", "Ah"),
-            ("soh", "SOH", "%"),
-            ("cycle_count", "Cycle count", ""),
-            ("cell_average", "Cell average", "V"),
-            ("cell_delta", "Cell delta", "V"),
-            ("highest_cell", "Highest cell", ""),
-            ("lowest_cell", "Lowest cell", ""),
-            ("mos_temperature", "MOS temperature", "°C"),
-            ("temperature_1", "Temperature 1", "°C"),
-            ("temperature_2", "Temperature 2", "°C"),
-            ("balance_current", "Balance current", "A"),
-            ("charge_mos", "Charge MOS", ""),
-            ("discharge_mos", "Discharge MOS", ""),
-            ("errors_bitmask", "Errors", ""),
+            ("pack_voltage", "Pack voltage", "V", "Pack"),
+            ("pack_current", "Pack current", "A", "Pack"),
+            ("pack_power", "Pack power", "W", "Pack"),
+            ("soc", "State of charge", "%", "Capacity"),
+            ("remaining_capacity", "Remaining capacity", "Ah", "Capacity"),
+            ("nominal_capacity", "Nominal capacity", "Ah", "Capacity"),
+            ("soh", "State of health", "%", "Capacity"),
+            ("cycle_count", "Cycle count", "", "Capacity"),
+            ("cell_average", "Cell average", "V", "Cells"),
+            ("cell_delta", "Cell delta", "V", "Cells"),
+            ("highest_cell", "Highest cell", "", "Cells"),
+            ("lowest_cell", "Lowest cell", "", "Cells"),
+            ("balance_current", "Balance current", "A", "Cells"),
+            ("mos_temperature", "MOS temperature", "°C", "Temperatures & state"),
+            ("temperature_1", "Temperature 1", "°C", "Temperatures & state"),
+            ("temperature_2", "Temperature 2", "°C", "Temperatures & state"),
+            ("charge_mos", "Charge MOS", "", "Temperatures & state"),
+            ("discharge_mos", "Discharge MOS", "", "Temperatures & state"),
+            ("errors_bitmask", "Errors", "", "Temperatures & state"),
         ]
-        self.live_units = {key: unit for key, _, unit in live_fields}
-        for row, (key, label, _unit) in enumerate(live_fields):
-            ttk.Label(dashboard, text=label + ":").grid(row=row, column=0, sticky="e", padx=(0, 12), pady=2)
+        self.live_units = {key: unit for key, _, unit, _ in live_fields}
+        dashboard.columnconfigure(0, weight=1)
+        dashboard.columnconfigure(1, weight=1)
+        groups: dict[str, ttk.LabelFrame] = {}
+        group_positions = {
+            "Pack": (0, 0),
+            "Capacity": (0, 1),
+            "Cells": (1, 0),
+            "Temperatures & state": (1, 1),
+        }
+        group_rows: dict[str, int] = {name: 0 for name in group_positions}
+        for name, (row, col) in group_positions.items():
+            frame = ttk.LabelFrame(dashboard, text=name, padding=12, style="Section.TLabelframe")
+            frame.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
+            frame.columnconfigure(1, weight=1)
+            groups[name] = frame
+        dashboard.rowconfigure(0, weight=1)
+        dashboard.rowconfigure(1, weight=1)
+        for key, label, _unit, group in live_fields:
+            frame = groups[group]
+            row = group_rows[group]
+            group_rows[group] += 1
+            ttk.Label(frame, text=label, style="MetricName.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 18), pady=4)
             var = tk.StringVar(value="—")
             self.live_values[key] = var
-            ttk.Label(dashboard, textvariable=var, font=("Consolas", 10)).grid(row=row, column=1, sticky="w", pady=2)
-        dashboard.columnconfigure(1, weight=1)
+            ttk.Label(frame, textvariable=var, style="MetricValue.TLabel").grid(row=row, column=1, sticky="e", pady=4)
 
         self.settings_tree = ttk.Treeview(
             settings_tab,
@@ -173,10 +254,10 @@ class OpenJKApp:
             self.settings_tree.column(col, width=width, anchor=anchor)
         self.settings_tree.pack(fill="both", expand=True)
 
-        # Physical cell laboratory
+        # Physical cell laboratory: the heart of OpenJK's "see the battery breathing" view.
         cell_toolbar = ttk.Frame(cells_tab)
         cell_toolbar.pack(fill="x", pady=(0, 8))
-
+        ttk.Label(cell_toolbar, text="Visualization", font=("TkDefaultFont", 10, "bold")).pack(side="left", padx=(0, 10))
         ttk.Label(cell_toolbar, text="Color mode:").pack(side="left")
         self.cell_mode_combo = ttk.Combobox(
             cell_toolbar,
@@ -186,214 +267,92 @@ class OpenJKApp:
             width=18,
         )
         self.cell_mode_combo.pack(side="left", padx=(6, 14))
-        self.cell_mode_combo.bind(
-            "<<ComboboxSelected>>", lambda _event: self._draw_cell_map()
-        )
-
+        self.cell_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._draw_cell_map())
         ttk.Label(cell_toolbar, text="Band:").pack(side="left")
         self.cell_band_spin = ttk.Spinbox(
-            cell_toolbar,
-            from_=1.0,
-            to=20.0,
-            increment=1.0,
-            textvariable=self.cell_band_mv,
-            width=5,
-            command=self._draw_cell_map,
+            cell_toolbar, from_=1.0, to=20.0, increment=1.0, textvariable=self.cell_band_mv, width=5, command=self._draw_cell_map
         )
         self.cell_band_spin.pack(side="left", padx=(6, 2))
         ttk.Label(cell_toolbar, text="mV").pack(side="left")
-
-        ttk.Checkbutton(
-            cell_toolbar,
-            text="Capture history",
-            variable=self.history_enabled,
-        ).pack(side="left", padx=(18, 0))
-
+        ttk.Checkbutton(cell_toolbar, text="Capture history", variable=self.history_enabled).pack(side="left", padx=(18, 0))
         ttk.Label(
-            cell_toolbar,
-            text="  Keys: D deviation   V voltage   R resistance   H 60 s drift",
-            foreground="#5d6772",
+            cell_toolbar, text="Keys: D deviation   V voltage   R resistance   H 60 s drift", foreground="#6b7280"
         ).pack(side="left", padx=(14, 0))
-
-        ttk.Button(
-            cell_toolbar,
-            text="Load history…",
-            command=self._load_history,
-        ).pack(side="right")
-        ttk.Button(
-            cell_toolbar,
-            text="Live",
-            command=self._show_live_cells,
-        ).pack(side="right", padx=(0, 8))
+        ttk.Button(cell_toolbar, text="Load history…", command=self._load_history).pack(side="right")
+        ttk.Button(cell_toolbar, text="Live", command=self._show_live_cells).pack(side="right", padx=(0, 8))
 
         map_frame = ttk.Frame(cells_tab)
         map_frame.pack(fill="both", expand=True)
-
         self.cell_canvas = tk.Canvas(
-            map_frame,
-            background="#f7f8fa",
-            highlightthickness=1,
-            highlightbackground="#c8cdd3",
+            map_frame, background="#f8fafc", highlightthickness=1, highlightbackground="#c8cdd3"
         )
         self.cell_canvas.pack(side="left", fill="both", expand=True)
         self.cell_canvas.bind("<Configure>", lambda _event: self._draw_cell_map())
         self.cell_canvas.bind("<Motion>", self._cell_hover)
         self.cell_canvas.bind("<Leave>", self._cell_leave)
 
-        details = ttk.Frame(map_frame, padding=(12, 4))
-        details.pack(side="right", fill="y")
-        ttk.Label(details, text="Cell details", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        self.cell_detail_var = tk.StringVar(
-            value="Move the pointer over a cell."
-        )
-        ttk.Label(
-            details,
-            textvariable=self.cell_detail_var,
-            justify="left",
-            width=29,
-            wraplength=230,
-        ).pack(anchor="w", pady=(8, 18))
-
+        details = ttk.LabelFrame(map_frame, text="Cell details", padding=12, style="Section.TLabelframe")
+        details.pack(side="right", fill="y", padx=(10, 0))
+        self.cell_detail_var = tk.StringVar(value="Move the pointer over a cell.")
+        ttk.Label(details, textvariable=self.cell_detail_var, justify="left", width=29, wraplength=230).pack(anchor="w", pady=(2, 16))
         ttk.Separator(details, orient="horizontal").pack(fill="x", pady=4)
-        ttk.Label(details, text="Pack statistics", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(8, 4))
+        ttk.Label(details, text="Pack statistics", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(8, 4))
         self.cell_stats_var = tk.StringVar(value="Waiting for live cell data.")
-        ttk.Label(
-            details,
-            textvariable=self.cell_stats_var,
-            justify="left",
-            width=29,
-        ).pack(anchor="w")
+        ttk.Label(details, textvariable=self.cell_stats_var, justify="left", width=29).pack(anchor="w")
 
-        history_frame = ttk.LabelFrame(cells_tab, text="Time-lapse", padding=8)
+        history_frame = ttk.LabelFrame(cells_tab, text="Time-lapse", padding=8, style="Section.TLabelframe")
         history_frame.pack(fill="x", pady=(8, 0))
         self.history_status_var = tk.StringVar(value="Live view")
-        ttk.Label(
-            history_frame,
-            textvariable=self.history_status_var,
-        ).pack(side="left")
-
-        self.history_scale = ttk.Scale(
-            history_frame,
-            from_=0,
-            to=1,
-            orient="horizontal",
-            command=self._history_scrub,
-        )
+        ttk.Label(history_frame, textvariable=self.history_status_var).pack(side="left")
+        self.history_scale = ttk.Scale(history_frame, from_=0, to=1, orient="horizontal", command=self._history_scrub)
         self.history_scale.pack(side="left", fill="x", expand=True, padx=12)
         self.history_scale.configure(state="disabled")
-
-        self.history_play_button = ttk.Button(
-            history_frame,
-            text="▶ Play",
-            command=self._toggle_history_play,
-            state="disabled",
-        )
+        self.history_play_button = ttk.Button(history_frame, text="▶ Play", command=self._toggle_history_play, state="disabled")
         self.history_play_button.pack(side="right")
 
-        from .protocol import SAFE_WRITABLE_PARAMETERS
-
         ttk.Label(
             writes_tab,
             text=(
-                "All decoded JK02_32S settings use the same guarded write engine. "
-                "Every write saves a backup and is verified from a fresh settings frame."
+                "OpenJK treats configuration changes as transactions, not guesses. Every write saves a backup "
+                "and is verified from a fresh settings frame before it is accepted as successful."
             ),
-            wraplength=760,
-            justify="left",
+            wraplength=780, justify="left",
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 16))
-
-        ttk.Label(writes_tab, text="Selected BMS:").grid(
-            row=1, column=0, sticky="e", padx=(0, 10), pady=4
-        )
+        ttk.Label(writes_tab, text="Selected BMS:").grid(row=1, column=0, sticky="e", padx=(0, 10), pady=4)
         self.write_device_var = tk.StringVar(value="Not connected")
-        ttk.Label(
-            writes_tab, textvariable=self.write_device_var, font=("Consolas", 10)
-        ).grid(row=1, column=1, columnspan=2, sticky="w", pady=4)
-
-        ttk.Label(writes_tab, text="Parameter:").grid(
-            row=2, column=0, sticky="e", padx=(0, 10), pady=4
-        )
+        ttk.Label(writes_tab, textvariable=self.write_device_var, font=("TkFixedFont", 10)).grid(row=1, column=1, columnspan=2, sticky="w", pady=4)
+        ttk.Label(writes_tab, text="Parameter:").grid(row=2, column=0, sticky="e", padx=(0, 10), pady=4)
         self.write_parameter_var = tk.StringVar()
-        self.write_parameter_combo = ttk.Combobox(
-            writes_tab,
-            textvariable=self.write_parameter_var,
-            state="readonly",
-            width=38,
-        )
-        ordered = sorted(
-            SAFE_WRITABLE_PARAMETERS.items(),
-            key=lambda item: (item[1].category, item[1].label),
-        )
-        self.write_parameter_labels = {
-            f"{definition.category} — {definition.label}": key
-            for key, definition in ordered
-        }
+        self.write_parameter_combo = ttk.Combobox(writes_tab, textvariable=self.write_parameter_var, state="readonly", width=38)
+        ordered = sorted(SAFE_WRITABLE_PARAMETERS.items(), key=lambda item: (item[1].category, item[1].label))
+        self.write_parameter_labels = {f"{definition.category} — {definition.label}": key for key, definition in ordered}
         self.write_parameter_combo["values"] = list(self.write_parameter_labels)
         self.write_parameter_combo.grid(row=2, column=1, sticky="w", pady=4)
-        self.write_parameter_combo.bind(
-            "<<ComboboxSelected>>", self._write_parameter_selected
-        )
-
-        ttk.Label(writes_tab, text="Current value:").grid(
-            row=3, column=0, sticky="e", padx=(0, 10), pady=4
-        )
+        self.write_parameter_combo.bind("<<ComboboxSelected>>", self._write_parameter_selected)
+        ttk.Label(writes_tab, text="Current value:").grid(row=3, column=0, sticky="e", padx=(0, 10), pady=4)
         self.write_current_var = tk.StringVar(value="—")
-        ttk.Label(
-            writes_tab, textvariable=self.write_current_var, font=("Consolas", 11)
-        ).grid(row=3, column=1, sticky="w", pady=4)
-
-        ttk.Label(writes_tab, text="New value:").grid(
-            row=4, column=0, sticky="e", padx=(0, 10), pady=4
-        )
+        ttk.Label(writes_tab, textvariable=self.write_current_var, font=("TkFixedFont", 11)).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(writes_tab, text="New value:").grid(row=4, column=0, sticky="e", padx=(0, 10), pady=4)
         self.write_new_var = tk.StringVar()
         self.write_new_var.trace_add("write", self._write_new_changed)
-        self.write_new_entry = ttk.Entry(
-            writes_tab, textvariable=self.write_new_var, width=18, font=("Consolas", 11)
-        )
+        self.write_new_entry = ttk.Entry(writes_tab, textvariable=self.write_new_var, width=18, font=("TkFixedFont", 11))
         self.write_new_entry.grid(row=4, column=1, sticky="w", pady=4)
         self.write_unit_var = tk.StringVar(value="")
-        ttk.Label(writes_tab, textvariable=self.write_unit_var).grid(
-            row=4, column=2, sticky="w", padx=(6, 0), pady=4
-        )
-
+        ttk.Label(writes_tab, textvariable=self.write_unit_var).grid(row=4, column=2, sticky="w", padx=(6, 0), pady=4)
         buttons = ttk.Frame(writes_tab)
         buttons.grid(row=5, column=1, columnspan=2, sticky="w", pady=(14, 8))
-        self.write_button = ttk.Button(
-            buttons,
-            text="Back up, write, and verify",
-            command=self._safe_write,
-            state="disabled",
-        )
+        self.write_button = ttk.Button(buttons, text="Back up, write & verify", command=self._safe_write, state="disabled")
         self.write_button.pack(side="left")
-        self.restore_button = ttk.Button(
-            buttons,
-            text="Restore original value",
-            command=self._restore_original,
-            state="disabled",
-        )
+        self.restore_button = ttk.Button(buttons, text="Restore original value", command=self._restore_original, state="disabled")
         self.restore_button.pack(side="left", padx=(8, 0))
-
-        self.write_status_var = tk.StringVar(
-            value="Connect, read settings, and choose a parameter."
-        )
+        self.write_status_var = tk.StringVar(value="Connect, read settings, and choose a parameter.")
+        ttk.Label(writes_tab, textvariable=self.write_status_var, wraplength=780, justify="left").grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Separator(writes_tab, orient="horizontal").grid(row=7, column=0, columnspan=3, sticky="ew", pady=18)
         ttk.Label(
             writes_tab,
-            textvariable=self.write_status_var,
-            wraplength=780,
-            justify="left",
-        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
-
-        ttk.Separator(writes_tab, orient="horizontal").grid(
-            row=7, column=0, columnspan=3, sticky="ew", pady=18
-        )
-        ttk.Label(
-            writes_tab,
-            text=(
-                "Recommended first test: change Start balance voltage by 0.010 V, "
-                "verify PASS, then click Restore original value and verify PASS again."
-            ),
-            wraplength=760,
-            justify="left",
+            text=("Recommended first test: change Start balance voltage by 0.010 V, verify PASS, "
+                  "then click Restore original value and verify PASS again."),
+            wraplength=760, justify="left",
         ).grid(row=8, column=0, columnspan=3, sticky="w")
         writes_tab.columnconfigure(1, weight=1)
 
@@ -404,7 +363,7 @@ class OpenJKApp:
         self.identity_tree.column("value", width=420, anchor="w")
         self.identity_tree.pack(fill="both", expand=True)
 
-        self.raw_text = tk.Text(raw_tab, wrap="none", font=("Consolas", 9))
+        self.raw_text = tk.Text(raw_tab, wrap="none", font=("TkFixedFont", 9), background="#fbfcfd", relief="flat")
         ybar = ttk.Scrollbar(raw_tab, orient="vertical", command=self.raw_text.yview)
         xbar = ttk.Scrollbar(raw_tab, orient="horizontal", command=self.raw_text.xview)
         self.raw_text.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
@@ -416,10 +375,8 @@ class OpenJKApp:
 
         ttk.Label(
             outer,
-            text=(
-                "v0.4.5 keeps the bounded GUI event drain, protects user-edited Safe Write values, "
-                "and combines live signed deviation bars with the slow color-memory strip."
-            ),
+            text="OpenJK v0.4.7  •  Live visualization  •  Verified safe writes  •  Backup & restore",
+            foreground="#6b7280",
         ).pack(anchor="w", pady=(8, 0))
 
     def _connect_selected(self) -> None:
@@ -1717,11 +1674,58 @@ class OpenJKApp:
         self.root.after(150, self.root.destroy)
 
 
-def main() -> None:
-    root = tk.Tk()
+INSTANCE_LOCK_HOST = "127.0.0.1"
+INSTANCE_LOCK_PORT = 47646
+
+
+def _acquire_instance_lock() -> socket.socket | None:
+    """Hold a localhost socket for the lifetime of the process.
+
+    The lock is automatically released by the OS if OpenJK exits or crashes.
+    Binding only to loopback keeps it local to this computer and avoids any
+    dependency on writable lock-file locations across Windows/Linux/macOS.
+    """
+    lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        ttk.Style(root).theme_use("vista")
-    except tk.TclError:
-        pass
-    OpenJKApp(root)
-    root.mainloop()
+        # Windows can otherwise permit surprising rebinding behavior in some
+        # socket configurations.  Ask for exclusive ownership when available.
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            lock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        lock.bind((INSTANCE_LOCK_HOST, INSTANCE_LOCK_PORT))
+    except OSError:
+        lock.close()
+        return None
+    return lock
+
+
+def _show_already_running() -> None:
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        messagebox.showwarning(
+            "OpenJK already running",
+            "Another OpenJK window is already running on this computer.\n\n"
+            "Only one instance is allowed at a time to prevent competing BLE "
+            "connections and excessive polling.",
+            parent=root,
+        )
+    finally:
+        root.destroy()
+
+
+def main() -> None:
+    instance_lock = _acquire_instance_lock()
+    if instance_lock is None:
+        _show_already_running()
+        return
+
+    try:
+        root = tk.Tk()
+        try:
+            ttk.Style(root).theme_use("vista")
+        except tk.TclError:
+            pass
+        OpenJKApp(root)
+        root.mainloop()
+    finally:
+        instance_lock.close()
