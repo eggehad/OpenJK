@@ -1,4 +1,4 @@
-# OpenJK v0.4.7
+# OpenJK v0.5.2
 
 **OpenJK is an open-source desktop monitor, visualizer, and configuration workstation for JK Smart BMS hardware over Bluetooth Low Energy (BLE).**
 
@@ -316,6 +316,55 @@ shows a warning and exits cleanly.
 ---
 
 ## Release history
+
+
+
+
+### v0.5.3 — clean BMS switching on Windows
+
+- Treats scan results as identity hints rather than permanent Windows BLE handles.
+- Reacquires a fresh `BLEDevice` whenever the selected BMS changes.
+- Rebuilds the WinRT/Bleak session on transient handoff failures instead of reusing stale GATT state.
+- Ignores delayed disconnect callbacks from an obsolete BLE client generation so an old session cannot clobber the new one.
+
+### v0.5.2
+
+- Makes BMS-to-BMS switching resilient to transient Windows/Bleak handoff failures.
+- Automatically retries once when WinRT reports `The operation was canceled by the user` even though no user cancellation occurred.
+- Also retries once when Windows briefly exposes only generic GAP characteristics instead of the JK notify/write service.
+- Keeps true user-requested Disconnect cancellation distinct from Windows internal cancellation.
+
+### v0.5.1 — responsive live rendering
+
+- Removes synchronous history-file I/O from the Tk GUI thread. Live JSONL history is now written by a dedicated background writer with persistent file handles.
+- Caps the expensive cell-map canvas rebuild at 4 Hz while numerical telemetry remains live, so fresh data replaces stale paint work instead of accumulating behind it.
+- Protects the GUI from slow storage by bounding the history queue and dropping stale pending history samples rather than blocking controls or visualization.
+- Fixes the major responsiveness failure identified by v0.5.0 diagnostics, where a single `live` GUI event could consume roughly 0.8–2.0 seconds even though BLE connect and JK request/response traffic were healthy.
+- Corrects the application window/version identity to v0.5.1.
+
+### v0.5.0 — BLE connection observability
+
+- Makes the Windows/Bleak connection path visible in the GUI with explicit stages for scanning, connecting, GATT service resolution, notification setup, initial JK requests, and disconnect.
+- Writes BLE timing records directly from the BLE worker thread to the persistent raw log before they are queued to Tk, so the diagnostic trail survives a sluggish GUI or forced process termination.
+- Adds a session/version header to each raw log.
+- Retains the cancellable BLE operations and single-instance protection introduced in 0.4.7–0.4.9.
+- Intended to isolate long Windows BLE startup delays from the JK protocol itself; once connected, JK request/response traffic has been observed completing in roughly a tenth of a second during field testing.
+
+### v0.4.9
+
+- Reworked BLE command execution so the active operation is an explicit cancellable asyncio task.
+- Disconnect now cancels the in-flight BLE command before tearing down notifications and the client.
+- Added a bounded cancellation wait so a stuck Windows/Bleak operation cannot silently hold Disconnect behind it.
+- Added BLE timing instrumentation to the Raw frames/log output for connect, service lookup, notification startup, initial requests, first decoded frames, commands, and disconnect.
+- Intended to diagnose the repeatable 17–19 second Windows BLE latency observed during alternating tests of two JK BMS units.
+
+### v0.4.8
+
+- Made **Disconnect** a priority BLE control action instead of a normal queued command.
+- Added hard timeouts around BLE connect, notify, write, and disconnect operations so a stalled OS/BLE call cannot hold OpenJK indefinitely.
+- Cancels GUI-side pending writes/restores immediately when Disconnect is requested.
+- Prevents delayed Safe Write retries from firing after a disconnect.
+- Fixes the failure mode where a wedged BLE transaction made the Disconnect button ineffective and forced the OpenJK process to be killed.
 
 ### v0.4.7
 

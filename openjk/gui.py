@@ -6,6 +6,7 @@ from decimal import Decimal
 import json
 import queue
 import socket
+import threading
 import time
 import tkinter as tk
 from pathlib import Path
@@ -15,7 +16,7 @@ from typing import Any
 from .engine import BMSState, BleWorker, DeviceRow
 from .protocol import SAFE_WRITABLE_PARAMETERS, SETTINGS, settings_rows
 
-APP_VERSION = "0.4.7"
+APP_VERSION = "0.5.3"
 
 
 class OpenJKApp:
@@ -26,8 +27,20 @@ class OpenJKApp:
         self.root.minsize(1040, 700)
         self.root.option_add("*tearOff", False)
 
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.raw_log = Path.cwd() / f"openjk_raw_{stamp}.log"
+        self.gui_diag_log = Path.cwd() / f"openjk_gui_diag_{stamp}.log"
+
         self.events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
-        self.worker = BleWorker(self.events)
+        self.worker = BleWorker(self.events, trace_path=self.raw_log)
+        try:
+            with self.raw_log.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"{dt.datetime.now().astimezone().isoformat(timespec='milliseconds')} "
+                    f"OPENJK v{APP_VERSION} SESSION START\n"
+                )
+        except OSError:
+            pass
         self.devices: list[DeviceRow] = []
         self.state = BMSState()
         self.pending_write: dict[str, Any] | None = None
@@ -38,6 +51,7 @@ class OpenJKApp:
         self.restore_source = ""
         self.restore_prebackup = ""
         self.max_write_attempts = 3
+        self.connected = False
         self.write_new_dirty = False
         self._setting_write_new = False
 
@@ -60,9 +74,24 @@ class OpenJKApp:
         # Short rolling voltage history used by the H (60 s drift) display mode.
         self.cell_trend_history: list[tuple[float, dict[int, float]]] = []
 
-        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.raw_log = Path.cwd() / f"openjk_raw_{stamp}.log"
-        self.gui_diag_log = Path.cwd() / f"openjk_gui_diag_{stamp}.log"
+        # Live telemetry can arrive faster than a Tk canvas should be rebuilt.
+        # Numeric values may update on every frame, but the cell visualization is
+        # deliberately capped at 4 Hz.  Fresh telemetry wins over stale paint.
+        self.live_draw_interval_seconds = 0.250
+        self.last_live_draw_time = 0.0
+
+        # History persistence must never block the Tk event loop.  Older builds
+        # opened/wrote/closed the JSONL file on every live frame on the GUI thread,
+        # which could stall one event for ~1 second on Windows.
+        self.history_write_queue: "queue.Queue[tuple[Path, dict[str, Any]] | None]" = queue.Queue(maxsize=512)
+        self.history_writer_stop = threading.Event()
+        self.history_writer_thread = threading.Thread(
+            target=self._history_writer_main,
+            name="openjk-history-writer",
+            daemon=True,
+        )
+        self.history_writer_thread.start()
+
         self.gui_drain_cycles = 0
         self.gui_events_processed = 0
 
@@ -136,7 +165,7 @@ class OpenJKApp:
             toolbar, text="Scan for BMS", command=lambda: self.worker.send("scan"), style="Primary.TButton"
         ).pack(side="left")
         ttk.Button(toolbar, text="Connect", command=self._connect_selected).pack(side="left", padx=(8, 0))
-        ttk.Button(toolbar, text="Disconnect", command=lambda: self.worker.send("disconnect")).pack(side="left", padx=(6, 0))
+        ttk.Button(toolbar, text="Disconnect", command=self._request_disconnect).pack(side="left", padx=(6, 0))
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=12)
         ttk.Button(toolbar, text="Read settings", command=lambda: self.worker.send("read_settings")).pack(side="left")
         ttk.Button(toolbar, text="Read identity", command=lambda: self.worker.send("read_device")).pack(side="left", padx=(6, 0))
@@ -150,7 +179,11 @@ class OpenJKApp:
         ttk.Label(toolbar, text=f"Raw log: {self.raw_log.name}", foreground="#6b7280").pack(side="right")
 
         self.status_var = tk.StringVar(value="Ready. Scan for a nearby JK BMS.")
-        ttk.Label(outer, textvariable=self.status_var, anchor="w", style="Status.TLabel").pack(fill="x", pady=(9, 9))
+        self.connection_stage_var = tk.StringVar(value="BLE stage: idle")
+        status_row = ttk.Frame(outer)
+        status_row.pack(fill="x", pady=(9, 9))
+        ttk.Label(status_row, textvariable=self.status_var, anchor="w", style="Status.TLabel").pack(side="left", fill="x", expand=True)
+        ttk.Label(status_row, textvariable=self.connection_stage_var, anchor="e", foreground="#6b7280").pack(side="right", padx=(12, 0))
 
         paned = ttk.Panedwindow(outer, orient="horizontal")
         paned.pack(fill="both", expand=True)
@@ -174,6 +207,7 @@ class OpenJKApp:
         ).pack(anchor="w", pady=(6, 0))
 
         notebook = ttk.Notebook(right)
+        self.notebook = notebook
         notebook.pack(fill="both", expand=True)
 
         dashboard = ttk.Frame(notebook, padding=12)
@@ -375,7 +409,7 @@ class OpenJKApp:
 
         ttk.Label(
             outer,
-            text="OpenJK v0.4.7  •  Live visualization  •  Verified safe writes  •  Backup & restore",
+            text="OpenJK v0.5.3  •  Live visualization  •  Verified safe writes  •  Backup & restore",
             foreground="#6b7280",
         ).pack(anchor="w", pady=(8, 0))
 
@@ -614,16 +648,7 @@ class OpenJKApp:
                 },
                 result="RETRY_SCHEDULED",
             )
-            self.root.after(
-                1500,
-                lambda: self.worker.send(
-                    "write_parameter",
-                    {
-                        "key": pending["key"],
-                        "value": pending["expected"],
-                    },
-                ),
-            )
+            self.root.after(1500, lambda p=pending: self._retry_pending_write(p))
             return
 
         self.write_status_var.set(
@@ -647,6 +672,16 @@ class OpenJKApp:
             return
         self.pending_write = None
         self.write_button.configure(state="normal")
+
+    def _retry_pending_write(self, pending: dict[str, Any]) -> None:
+        # A delayed retry is valid only if the exact same transaction is still
+        # active and the BLE session is still connected.
+        if self.pending_write is not pending or not self.connected:
+            return
+        self.worker.send(
+            "write_parameter",
+            {"key": pending["key"], "value": pending["expected"]},
+        )
 
     def _restore_original(self) -> None:
         if not self.restore_value:
@@ -1029,6 +1064,20 @@ class OpenJKApp:
     def _handle_gui_event(self, kind: str, payload: Any) -> None:
         if kind == "status":
             self.status_var.set(str(payload))
+        elif kind == "timing":
+            message = str(payload)
+            timestamp = dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
+            line = f"{timestamp} BLE-TIMING {message}\n"
+            # The worker already persisted this record synchronously.  The GUI
+            # only mirrors it on screen, avoiding duplicate lines in the log.
+            try:
+                self.raw_text.insert("end", line)
+                self.raw_text.see("end")
+            except tk.TclError:
+                pass
+            self._diag(f"BLE TIMING {message}")
+        elif kind == "connection_stage":
+            self.connection_stage_var.set(f"BLE stage: {payload}")
         elif kind == "error":
             self.status_var.set(str(payload))
             if self.restore_queue or (self.pending_write and self.pending_write.get("batch_restore")):
@@ -1083,9 +1132,18 @@ class OpenJKApp:
             cells = payload.get("cells", [])
             self.latest_cells = [dict(cell) for cell in cells]
             self._record_cell_trend_sample(self.latest_cells)
-            if not self.history_samples:
+
+            # Paint at a controlled rate.  Rebuilding the entire Tk canvas for
+            # every BLE frame wastes work and lets stale frames queue behind it.
+            now = time.monotonic()
+            if (
+                not self.history_samples
+                and now - self.last_live_draw_time >= self.live_draw_interval_seconds
+            ):
                 self.display_cells = [dict(cell) for cell in cells]
+                self.last_live_draw_time = now
                 self._timed_gui_call("live.draw_cells", self._draw_cell_map)
+
             if self.history_enabled.get():
                 self._capture_history_sample(payload)
             self.status_var.set(
@@ -1113,15 +1171,38 @@ class OpenJKApp:
         except OSError:
             pass
 
+    def _request_disconnect(self) -> None:
+        # Cancel GUI-side transaction state immediately.  In older builds a
+        # retry scheduled with root.after() could survive a disconnect request
+        # and wake up later.  The worker now treats disconnect as a priority
+        # interrupt as well.
+        self.pending_write = None
+        self.restore_queue = []
+        self.restore_total = 0
+        self.restore_completed = 0
+        self.restore_source = ""
+        self.restore_prebackup = ""
+        self.write_button.configure(state="disabled")
+        self.restore_button.configure(state="disabled")
+        self.restore_backup_button.configure(state="disabled")
+        self.write_status_var.set("Disconnecting; any active write/restore has been cancelled.")
+        self.status_var.set("Disconnecting...")
+        self.worker.send("disconnect")
+
     def _handle_connected(self, payload: dict[str, Any]) -> None:
         if payload.get("connected"):
+            self.connected = True
             self.state.selected_device_name = payload.get("name", "")
             self.state.selected_device_address = payload.get("address", "")
             self.write_device_var.set(
                 f"{self.state.selected_device_name} ({self.state.selected_device_address})"
             )
         else:
-            if self.restore_queue or (self.pending_write and self.pending_write.get("batch_restore")):
+            self.connected = False
+            had_batch_restore = bool(
+                self.restore_queue or (self.pending_write and self.pending_write.get("batch_restore"))
+            )
+            if had_batch_restore:
                 completed = self.restore_completed
                 total = self.restore_total
                 self.restore_queue = []
@@ -1133,6 +1214,9 @@ class OpenJKApp:
                 self.write_status_var.set(
                     f"RESTORE STOPPED by disconnect after {completed}/{total} verified settings."
                 )
+            elif self.pending_write:
+                self.write_status_var.set("WRITE CANCELLED by disconnect.")
+            self.pending_write = None
             self.write_device_var.set("Not connected")
             self.write_button.configure(state="disabled")
             self.restore_button.configure(state="disabled")
@@ -1563,8 +1647,46 @@ class OpenJKApp:
                 for cell in cells
             ],
         }
-        with self._history_path().open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(sample, separators=(",", ":")) + "\n")
+        try:
+            self.history_write_queue.put_nowait((self._history_path(), sample))
+        except queue.Full:
+            # History is diagnostic/visualization data.  Never freeze live control
+            # because storage is temporarily slow; drop the oldest pending sample.
+            try:
+                self.history_write_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.history_write_queue.put_nowait((self._history_path(), sample))
+            except queue.Full:
+                pass
+
+    def _history_writer_main(self) -> None:
+        handles: dict[Path, Any] = {}
+        try:
+            while not self.history_writer_stop.is_set():
+                try:
+                    item = self.history_write_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    break
+                path, sample = item
+                try:
+                    handle = handles.get(path)
+                    if handle is None or handle.closed:
+                        path.parent.mkdir(exist_ok=True)
+                        handle = path.open("a", encoding="utf-8", buffering=1)
+                        handles[path] = handle
+                    handle.write(json.dumps(sample, separators=(",", ":")) + "\n")
+                except OSError as exc:
+                    self._diag(f"HISTORY WRITE ERROR {type(exc).__name__}: {exc}")
+        finally:
+            for handle in handles.values():
+                try:
+                    handle.close()
+                except OSError:
+                    pass
 
     def _load_history(self) -> None:
         filename = filedialog.askopenfilename(
@@ -1670,6 +1792,11 @@ class OpenJKApp:
 
     def _close(self) -> None:
         self._stop_history_play()
+        self.history_writer_stop.set()
+        try:
+            self.history_write_queue.put_nowait(None)
+        except queue.Full:
+            pass
         self.worker.send("stop")
         self.root.after(150, self.root.destroy)
 
