@@ -12,9 +12,9 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
 from .engine import BMSState, BleWorker, DeviceRow
-from .protocol import SETTINGS, settings_rows
+from .protocol import SAFE_WRITABLE_PARAMETERS, SETTINGS, settings_rows
 
-APP_VERSION = "0.4.5"
+APP_VERSION = "0.4.6"
 
 
 class OpenJKApp:
@@ -30,6 +30,11 @@ class OpenJKApp:
         self.state = BMSState()
         self.pending_write: dict[str, Any] | None = None
         self.restore_value: dict[str, Any] | None = None
+        self.restore_queue: list[dict[str, Any]] = []
+        self.restore_total = 0
+        self.restore_completed = 0
+        self.restore_source = ""
+        self.restore_prebackup = ""
         self.max_write_attempts = 3
         self.write_new_dirty = False
         self._setting_write_new = False
@@ -78,6 +83,10 @@ class OpenJKApp:
         ttk.Button(toolbar, text="Read identity", command=lambda: self.worker.send("read_device")).pack(side="left", padx=(8, 0))
         self.backup_button = ttk.Button(toolbar, text="Save backup…", command=self._save_backup, state="disabled")
         self.backup_button.pack(side="left", padx=(8, 0))
+        self.restore_backup_button = ttk.Button(
+            toolbar, text="Restore backup…", command=self._restore_backup, state="disabled"
+        )
+        self.restore_backup_button.pack(side="left", padx=(8, 0))
         ttk.Label(toolbar, text=f"Raw log: {self.raw_log.name}").pack(side="right")
 
         self.status_var = tk.StringVar(value="Ready. Click Scan.")
@@ -596,13 +605,7 @@ class OpenJKApp:
 
         if passed:
             attempts = int(pending.get("attempt", 1))
-            self.write_status_var.set(
-                f"PASS after {attempts} attempt"
-                f"{'' if attempts == 1 else 's'}: {pending['label']} "
-                f"read back as {float(actual):.3f} {pending['unit']}. "
-                "The original value is available for restoration."
-            )
-            self.restore_button.configure(state="normal")
+            batch_restore = bool(pending.get("batch_restore"))
             self.write_current_var.set(
                 f"{float(actual):.3f} {pending['unit']}"
             )
@@ -613,7 +616,23 @@ class OpenJKApp:
                 else:
                     decimals = max(0, -Decimal(str(definition.step)).as_tuple().exponent)
                     self._set_write_new(f"{float(actual):.{decimals}f}", clean=True)
+
             self.pending_write = None
+            if batch_restore:
+                self.write_status_var.set(
+                    f"PASS {pending.get('restore_number', '?')}/{pending.get('restore_total', '?')}: "
+                    f"{pending['label']} read back as {float(actual):.3f} {pending['unit']}."
+                )
+                self._finish_backup_restore_item(float(actual))
+                return
+
+            self.write_status_var.set(
+                f"PASS after {attempts} attempt"
+                f"{'' if attempts == 1 else 's'}: {pending['label']} "
+                f"read back as {float(actual):.3f} {pending['unit']}. "
+                "The original value is available for restoration."
+            )
+            self.restore_button.configure(state="normal")
             self.write_button.configure(state="normal")
             return
 
@@ -664,6 +683,11 @@ class OpenJKApp:
             },
             result="FAILED_AFTER_RETRIES",
         )
+        if pending.get("batch_restore"):
+            self._abort_backup_restore(
+                f"{pending['label']} failed verification after {maximum} attempts; no further restore writes were sent."
+            )
+            return
         self.pending_write = None
         self.write_button.configure(state="normal")
 
@@ -672,7 +696,6 @@ class OpenJKApp:
             messagebox.showinfo("OpenJK", "No original value is queued for restoration.")
             return
 
-        from .protocol import SAFE_WRITABLE_PARAMETERS
         restore = self.restore_value
         definition = SAFE_WRITABLE_PARAMETERS[restore["key"]]
         value = float(restore["value"])
@@ -756,6 +779,254 @@ class OpenJKApp:
         self.state.save_backup(Path(filename))
         self.status_var.set(f"Backup saved: {filename}")
 
+    def _restore_backup(self) -> None:
+        if not self.state.selected_device_name or not self.state.settings:
+            messagebox.showinfo(
+                "OpenJK",
+                "Connect to the intended BMS and read its settings before restoring a backup.",
+            )
+            return
+        if self.pending_write or self.restore_queue:
+            messagebox.showinfo("OpenJK", "A write or restore operation is already in progress.")
+            return
+
+        filename = filedialog.askopenfilename(
+            title="Restore JK BMS settings from OpenJK backup",
+            filetypes=[("OpenJK JSON backup", "*.json"), ("All files", "*.*")],
+        )
+        if not filename:
+            return
+
+        try:
+            document = json.loads(Path(filename).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror("OpenJK", f"Could not read backup:\n{exc}")
+            return
+
+        if not isinstance(document, dict) or document.get("format") != "openjk-backup":
+            messagebox.showerror("OpenJK", "This is not an OpenJK backup file.")
+            return
+        if document.get("format_version") != 1:
+            messagebox.showerror(
+                "OpenJK",
+                f"Unsupported backup format version: {document.get('format_version')!r}",
+            )
+            return
+
+        backup_settings = document.get("settings")
+        if not isinstance(backup_settings, dict):
+            messagebox.showerror("OpenJK", "The backup does not contain a settings object.")
+            return
+
+        backup_device = document.get("device")
+        if not isinstance(backup_device, dict):
+            backup_device = {}
+        backup_serial = backup_device.get("serial_number")
+        current_serial = self.state.device_info.get("serial_number")
+        if backup_serial and current_serial and str(backup_serial) != str(current_serial):
+            proceed = messagebox.askyesno(
+                "Backup belongs to a different BMS",
+                (
+                    f"Backup serial: {backup_serial}\n"
+                    f"Connected serial: {current_serial}\n\n"
+                    "The backup was created from a different BMS. Restore only if that is intentional.\n\n"
+                    "Continue?"
+                ),
+            )
+            if not proceed:
+                return
+
+        changes: list[dict[str, Any]] = []
+        rejected: list[str] = []
+        for key, definition in SAFE_WRITABLE_PARAMETERS.items():
+            if key not in backup_settings or key not in self.state.settings:
+                continue
+            try:
+                target = float(backup_settings[key])
+                current = float(self.state.settings[key])
+            except (TypeError, ValueError) as exc:
+                rejected.append(f"{definition.label}: {exc}")
+                continue
+
+            tolerance = 0.5 / definition.factor
+            if abs(target - current) <= tolerance:
+                continue
+
+            try:
+                definition.encode(target)  # Validate only values that would actually be written.
+            except ValueError as exc:
+                rejected.append(f"{definition.label}: {exc}")
+                continue
+
+            changes.append(
+                {
+                    "key": key,
+                    "label": definition.label,
+                    "value": target,
+                    "current": current,
+                    "unit": definition.unit,
+                    "factor": definition.factor,
+                    "register": definition.register,
+                    "critical": definition.critical,
+                }
+            )
+
+        if rejected:
+            preview = "\n".join(rejected[:8])
+            if len(rejected) > 8:
+                preview += f"\n...and {len(rejected) - 8} more"
+            messagebox.showerror(
+                "Backup contains invalid writable values",
+                "No settings were changed.\n\n" + preview,
+            )
+            return
+
+        if not changes:
+            messagebox.showinfo(
+                "OpenJK",
+                "All writable settings in this backup already match the connected BMS.",
+            )
+            return
+
+        preview_lines = []
+        for item in changes[:12]:
+            marker = " [CRITICAL]" if item["critical"] else ""
+            preview_lines.append(
+                f"{item['label']}: {item['current']:g} -> {item['value']:g} {item['unit']}{marker}".rstrip()
+            )
+        if len(changes) > 12:
+            preview_lines.append(f"...and {len(changes) - 12} more")
+
+        critical_count = sum(1 for item in changes if item["critical"])
+        confirm = messagebox.askyesno(
+            "Confirm backup restore",
+            (
+                f"Selected BMS:\n{self.state.selected_device_name}\n"
+                f"{self.state.selected_device_address}\n\n"
+                f"Backup: {Path(filename).name}\n"
+                f"Writable settings that differ: {len(changes)}\n"
+                f"Critical settings included: {critical_count}\n\n"
+                + "\n".join(preview_lines)
+                + "\n\nOpenJK will first save the CURRENT settings, then restore one setting "
+                "at a time and verify every readback. The restore stops immediately if any "
+                "setting fails verification.\n\nProceed?"
+            ),
+        )
+        if not confirm:
+            return
+
+        backups = Path.cwd() / "backups"
+        backups.mkdir(exist_ok=True)
+        serial = current_serial or self.state.selected_device_name or "jkbms"
+        safe_serial = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(serial))
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        prebackup = backups / f"{safe_serial}_pre_restore_{stamp}.json"
+        try:
+            self.state.save_backup(prebackup)
+        except OSError as exc:
+            messagebox.showerror(
+                "OpenJK",
+                f"Could not save the safety backup. Nothing was changed.\n\n{exc}",
+            )
+            return
+
+        self.restore_queue = changes
+        self.restore_total = len(changes)
+        self.restore_completed = 0
+        self.restore_source = filename
+        self.restore_prebackup = str(prebackup)
+        self.restore_value = None
+        self.restore_button.configure(state="disabled")
+        self.write_button.configure(state="disabled")
+        self.restore_backup_button.configure(state="disabled")
+        self._start_next_backup_restore()
+
+    def _start_next_backup_restore(self) -> None:
+        if not self.restore_queue:
+            self.write_status_var.set(
+                f"RESTORE COMPLETE: verified {self.restore_completed}/{self.restore_total} settings. "
+                f"Pre-restore safety backup: {self.restore_prebackup}"
+            )
+            self.write_button.configure(state="normal")
+            self.restore_backup_button.configure(state="normal")
+            self.restore_total = 0
+            self.restore_completed = 0
+            self.restore_source = ""
+            self.restore_prebackup = ""
+            return
+
+        item = self.restore_queue[0]
+        definition = SAFE_WRITABLE_PARAMETERS[item["key"]]
+        _raw_value, frame = definition.encode(float(item["value"]))
+        current = float(self.state.settings.get(item["key"], item["current"]))
+        number = self.restore_completed + 1
+
+        self.pending_write = {
+            "key": item["key"],
+            "label": definition.label,
+            "expected": float(item["value"]),
+            "old": current,
+            "unit": definition.unit,
+            "factor": definition.factor,
+            "register": definition.register,
+            "frame": frame,
+            "backup_path": self.restore_prebackup,
+            "started_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "attempt": 1,
+            "max_attempts": self.max_write_attempts,
+            "batch_restore": True,
+            "restore_number": number,
+            "restore_total": self.restore_total,
+            "restore_source": self.restore_source,
+        }
+        self.write_status_var.set(
+            f"Restoring {number}/{self.restore_total}: {definition.label} -> "
+            f"{float(item['value']):g} {definition.unit}; waiting for verified readback..."
+        )
+        self.worker.send(
+            "write_parameter",
+            {"key": item["key"], "value": float(item["value"])},
+        )
+
+    def _finish_backup_restore_item(self, actual: float) -> None:
+        if not self.restore_queue:
+            return
+        item = self.restore_queue.pop(0)
+        self.restore_completed += 1
+        self._append_transaction_log(
+            "RESTORE_ITEM",
+            {
+                "key": item["key"],
+                "label": item["label"],
+                "expected": float(item["value"]),
+                "actual": float(actual),
+                "restore_number": self.restore_completed,
+                "restore_total": self.restore_total,
+                "restore_source": self.restore_source,
+                "backup_path": self.restore_prebackup,
+            },
+            result="PASS",
+        )
+        self.root.after(350, self._start_next_backup_restore)
+
+    def _abort_backup_restore(self, message: str) -> None:
+        completed = self.restore_completed
+        total = self.restore_total
+        self.restore_queue = []
+        self.restore_total = 0
+        self.restore_completed = 0
+        source = self.restore_source
+        prebackup = self.restore_prebackup
+        self.restore_source = ""
+        self.restore_prebackup = ""
+        self.pending_write = None
+        self.write_button.configure(state="normal")
+        self.restore_backup_button.configure(state="normal")
+        self.write_status_var.set(
+            f"RESTORE STOPPED after {completed}/{total} verified settings. {message} "
+            f"Source: {source}. Pre-restore safety backup: {prebackup}"
+        )
+
     def _drain_events(self) -> None:
         # Keep GUI work bounded so a continuous BLE stream can never monopolize
         # Tk/Windows message processing.  v0.4.4 keeps the v0.4.2 fix but only
@@ -803,6 +1074,8 @@ class OpenJKApp:
             self.status_var.set(str(payload))
         elif kind == "error":
             self.status_var.set(str(payload))
+            if self.restore_queue or (self.pending_write and self.pending_write.get("batch_restore")):
+                self._abort_backup_restore(f"Worker error: {payload}")
             messagebox.showerror("OpenJK error", str(payload))
         elif kind == "devices":
             self._show_devices(payload)
@@ -822,6 +1095,8 @@ class OpenJKApp:
             self.state.last_update = dt.datetime.now().isoformat(timespec="seconds")
             self._timed_gui_call("settings.display", self._display_settings, payload)
             self.backup_button.configure(state="normal")
+            if not self.restore_queue and not self.pending_write:
+                self.restore_backup_button.configure(state="normal")
             self._timed_gui_call("settings.refresh_write", self._refresh_write_panel)
             self._timed_gui_call("settings.pending_write", self._check_pending_write, payload)
             self.status_var.set(f"Settings received: {len(settings_rows(payload))} decoded values")
@@ -889,9 +1164,22 @@ class OpenJKApp:
                 f"{self.state.selected_device_name} ({self.state.selected_device_address})"
             )
         else:
+            if self.restore_queue or (self.pending_write and self.pending_write.get("batch_restore")):
+                completed = self.restore_completed
+                total = self.restore_total
+                self.restore_queue = []
+                self.restore_total = 0
+                self.restore_completed = 0
+                self.restore_source = ""
+                self.restore_prebackup = ""
+                self.pending_write = None
+                self.write_status_var.set(
+                    f"RESTORE STOPPED by disconnect after {completed}/{total} verified settings."
+                )
             self.write_device_var.set("Not connected")
             self.write_button.configure(state="disabled")
             self.restore_button.configure(state="disabled")
+            self.restore_backup_button.configure(state="disabled")
             self.status_var.set("Disconnected")
 
     def _show_devices(self, devices: list[DeviceRow]) -> None:

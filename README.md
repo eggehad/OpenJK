@@ -73,6 +73,7 @@ moving, balancing, or persisting over time.
 - complete settings decoding
 - 47 mapped writable settings and controls
 - automatic backups
+- restore complete settings backups with per-setting verified readback and stop-on-failure safety
 - guarded writes
 - fresh readback verification
 - rejection reporting and retry
